@@ -1,0 +1,6 @@
+File: ./text_inputs/random_200000.txt
+Threads: 2
+Total Time:  0.170798
+Total: 200000 Unique: 198331
+Batch Size: 128
+

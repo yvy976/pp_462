@@ -1,0 +1,6 @@
+File: ./text_inputs/random_400000.txt
+Threads: 4
+Total Time:  0.266092
+Total: 400000 Unique: 393423
+Batch Size: 128
+
