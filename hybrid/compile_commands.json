@@ -1,7 +1,0 @@
-[
-{
-  "directory": "/nfs/home/sdao/CS462/final_project/pp_462/mpi",
-  "command": "mpicc -fopenmp -Wall -Wextra -Iinclude -O3 -c src/main.c",
-  "file": "src/main.c"
-}
-]
