@@ -1,7 +1,7 @@
 CC = mpicc
 CFLAGS = -fopenmp -Wall -Wextra -Iinclude -O3
 SRCS := $(wildcard src/*.c)
-TARGET = wc
+TARGET = bin/wc
 
 all: $(TARGET)
 
