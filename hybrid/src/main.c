@@ -7,13 +7,23 @@
 #include "hashtable.h"
 #include "str_pool.h"
 
-#define HT_CAPACITY (1 << 23)				// Total Capacity for all threads combined
-																		// (ENTRIES NOT BYTES)
 
-#define READBUFSIZE (1 << 6)				// BYTES
+#define GLOBAL_STRIPE_SIZE 		 (1 << 6)
+#define GLOBAL_HT_CAPACITY_MUL (1 << 8)		// Defines a multiplier for the global
+																					// map size as a multiple of PER THREAD
+																					// map sizes (HT_CAPACITY / N_THREADS)
 
-#define SP_CAPACITY (1 << 20)				// Total SP Capacity for all threads combined
-																		// BYTES
+#define HT_CAPACITY (1 << 23)							// Total Capacity for all threads combined
+																					// (ENTRIES NOT BYTES)
+
+#define READBUFSIZE (1 << 6)							// BYTES
+
+#define GLOBAL_SP_CAPACITY_MUL (1 << 6)		// Defines a multiplier for the global
+																					// map's string pool as a multiple of PER THREAD
+																					// String Pool sizes
+
+#define SP_CAPACITY (1 << 25)							// Total SP Capacity for all threads combined
+																					// BYTES
 
 enum ReadState {
 	CONSUME,			// consume whitespace
@@ -71,10 +81,39 @@ void calculate_start_offsets(FILE* f, size_t filesize, size_t* file_offsets, siz
 }
 
 int map_reduce(size_t file_count, char** file_names) {
-	size_t n_readmap_threads = (size_t) omp_get_max_threads();
+	//
+	// PHASE 1
+	//
+	const size_t n_readmap_threads = (size_t) omp_get_max_threads();
+	const size_t t_ht_capacity = HT_CAPACITY / n_readmap_threads;			// PER THREAD HT Capacity
+	const size_t t_sp_capacity = SP_CAPACITY / n_readmap_threads; 		// PER THREAD SP Capacity
+	const size_t g_ht_capacity = t_ht_capacity * GLOBAL_HT_CAPACITY_MUL;
+	const size_t g_sp_capacity = t_sp_capacity * GLOBAL_SP_CAPACITY_MUL;
+	const size_t g_num_locks 	 = (g_ht_capacity % GLOBAL_STRIPE_SIZE) ? (g_ht_capacity / GLOBAL_STRIPE_SIZE) : (g_ht_capacity / GLOBAL_STRIPE_SIZE + 1);
+	
+	double alloc_start, alloc_end;
+	
+	fprintf(stderr, "Allocating Data\n");
+	alloc_start = MPI_Wtime();
+
+	// Per Thread Data Arrays
 	size_t* file_offsets = malloc(sizeof(*file_offsets) * n_readmap_threads);
 	StringPool** str_pools = malloc(sizeof(*str_pools) * n_readmap_threads);
 	HashTable** maps = malloc(sizeof(HashTable*) * n_readmap_threads);
+
+	// Allocate Process Data
+	StringPool* g_map_sp = sp_new(g_sp_capacity);
+	if (!g_map_sp) { fprintf(stderr, "Failed to allocate global map string pool"); return 1;}
+	HashTable* g_map_ht = ht_new(g_ht_capacity);
+	if (!g_map_ht) { fprintf(stderr, "Failed to allocate global map\n"); return 1; }
+	omp_lock_t* g_map_locks = malloc(sizeof(*g_map_locks) * g_num_locks);
+	if (!g_map_locks) { fprintf(stderr, "Failed to allocate global map locks"); return 1; }
+	for (size_t i = 0; i < g_num_locks; i++) {
+		omp_init_lock(g_map_locks + i);
+	}
+	
+	omp_lock_t global_map_lock;
+	omp_init_lock(&global_map_lock);
 
 	// Allocate Maps
 	for (size_t i = 0; i < n_readmap_threads; i++) {
@@ -82,6 +121,14 @@ int map_reduce(size_t file_count, char** file_names) {
 				{ fprintf(stderr, "Failed to allocate hashtable for %lu\n", i); return 1; } 
 		if (!(str_pools[i] = sp_new(SP_CAPACITY / n_readmap_threads))) { fprintf (stderr, "Failed to allocate str pool for %lu\n", i); return 1; }
 	}
+
+	alloc_end = MPI_Wtime();
+
+	fprintf(stderr, "It took %lf seconds to allocate data\n", alloc_end - alloc_start);
+	
+	//
+	// PHASE 2
+	//
 	
 	for (size_t i = 0; i < file_count; i++) { 
 		//
@@ -104,13 +151,13 @@ int map_reduce(size_t file_count, char** file_names) {
 
 		fclose(f);
 
-		// OFFSET DEBUG PRINT
-		/*
-		  for (size_t i = 0; i < n_readmap_threads; i++) {
-			fprintf(stderr, "File offset for %lu: %lu (from %lu)\n", i, file_offsets[i], i * (filesize / n_readmap_threads));
-		}
-		*/
+		//
+		// PHASE 2.1
+		//
+		
+		double readmap_start, readmap_end;
 
+		readmap_start = MPI_Wtime();
 		#pragma omp parallel for
 		for (size_t i = 0; i < n_readmap_threads; i++) {
 			size_t start = file_offsets[i];
@@ -124,14 +171,16 @@ int map_reduce(size_t file_count, char** file_names) {
 			char buf[READBUFSIZE];
 			enum ReadState state = PROCESS;
 			int c = fgetc(f);
+			
+			//
+			// PARSING/READING/MAPPING LOOP
+			//
 			for (size_t offset = start; offset < end && c != EOF; offset++, c = fgetc(f)) {
 				switch (state) {
 					case PROCESS:
-						// fprintf(stderr, "i: %lu, PROCESS: %c\n", i, c);
-						if (!is_alphanum(c)) {
+						if (!is_alphanum(c)) {	// INSERT WORD
 							size_t sp_offset = sp_add(str_pools[i], buf, len);
-							// fprintf(stdout, "i: %lu, inserted string: %s\n", i, sp_get(sp, sp_offset);
-							ht_insert(maps[i], fnv_hash(buf, len), sp_offset, str_pools[i]);
+							ht_insert(maps[i], fnv_hash(buf, len), sp_offset, len, str_pools[i]);
 							len = 0;
 							fseek(f, -1, SEEK_CUR);
 							offset -= 1;
@@ -141,7 +190,6 @@ int map_reduce(size_t file_count, char** file_names) {
 						}
 						break;
 					case CONSUME:
-						// fprintf(stderr, "i: %lu, PROCESS %c\n", i, c);
 						if (is_alphanum(c)) {
 							fseek(f, -1, SEEK_CUR);
 							offset -= 1;
@@ -150,7 +198,36 @@ int map_reduce(size_t file_count, char** file_names) {
 						break;
 				}
 			}
+			
+			//
+			// AGGREGATE Thread-Local Maps to Global Map
+			//
+			
+			double aggregate_start, aggregate_end;
+
+			aggregate_start = MPI_Wtime();
+			
+			for (size_t entries = 0; entries < t_ht_capacity; entries++) {
+				//fprintf(stderr, "%lu\n", i);
+				HashEntry* entry = maps[i]->entries + entries;
+				if (!entry->count) continue;
+				
+				char* old_key = sp_get(str_pools[i], entry->key);
+				size_t new_key = sp_add(g_map_sp, old_key, entry->len); 
+				// fprintf(stderr, "inserting string: %s from local to global\n", old_key);
+				ht_locked_insert(g_map_ht, entry->hash, new_key, entry->len, g_map_sp, g_map_locks, g_num_locks);
+				// omp_set_lock(&global_map_lock);
+				//ht_insert(g_map_ht, entry->hash, new_key, entry->len, g_map_sp);
+				//omp_unset_lock(&global_map_lock);
+			}
+
+			aggregate_end = MPI_Wtime();
+
+			fprintf(stderr, "Aggregate took thread %lu, %lf seconds.\n", i, aggregate_end - aggregate_start);
 		}
+		readmap_end = MPI_Wtime();
+
+		fprintf(stderr, "ReadMap took %lf seconds.\n", readmap_end - readmap_start);
 
 		// DEBUG STATS
 		fprintf(stderr, "HashTables\n");
@@ -158,12 +235,20 @@ int map_reduce(size_t file_count, char** file_names) {
 			ht_print(maps[i]);
 		}
 
+		fprintf(stderr, "GLOBAL HashTable:\n");
+		ht_print(g_map_ht);
+
 		// String Pools seem to be fine since they can grow in memory
-		/* fprintf(stderr, "StringPools:\n");
+		fprintf(stderr, "StringPools:\n");
 		for (size_t i = 0; i < n_readmap_threads; i++) {
 			sp_print(str_pools[i]);
 		}
-		*/
+
+		fprintf(stderr, "GLOBAL StringPool: (Doens't Have Locking RN)\n");
+		sp_print(g_map_sp);
+
+		ht_clear(maps[i]);
+		sp_clear(str_pools[i]); 
 	}
 	//
 	// CLEAN

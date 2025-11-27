@@ -62,7 +62,7 @@ size_t 		  sp_add(StringPool* sp, const char* str, size_t len) {
 
 	// copy in new string + NULL terminator
 	size_t str_start = sp->used;
-	memcpy(sp->store + str_start, str, len);
+	strncpy(sp->store + str_start, str, len);
 	sp->store[sp->used + len] = '\0';
 
 	// update stringpool fields
@@ -76,6 +76,11 @@ char* sp_get(StringPool* sp, size_t offset) {
 	return sp->store + offset;
 }
 
+void sp_clear(StringPool* sp) {
+	sp->used = 0;
+	sp->count = 0;
+}
+
 void sp_print(StringPool* sp) {
-	fprintf(stderr, "\t[SP] Used: %lu/%lu (%lf%%)\n\tWords: %lu\n", sp->used, sp->capacity, (double) sp->used / sp->capacity, sp->count);
+	fprintf(stderr, "\t[SP] Used: %lu/%lu (%lf%%)\n\tWords: %lu\n", sp->used, sp->capacity, (double) sp->used * 100 / sp->capacity, sp->count);
 }
