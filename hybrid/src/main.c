@@ -104,10 +104,12 @@ int map_reduce(size_t file_count, char** file_names) {
 
 		fclose(f);
 
-		// DEBUG PRINT
-		for (size_t i = 0; i < n_readmap_threads; i++) {
+		// OFFSET DEBUG PRINT
+		/*
+		  for (size_t i = 0; i < n_readmap_threads; i++) {
 			fprintf(stderr, "File offset for %lu: %lu (from %lu)\n", i, file_offsets[i], i * (filesize / n_readmap_threads));
 		}
+		*/
 
 		#pragma omp parallel for
 		for (size_t i = 0; i < n_readmap_threads; i++) {
@@ -149,6 +151,19 @@ int map_reduce(size_t file_count, char** file_names) {
 				}
 			}
 		}
+
+		// DEBUG STATS
+		fprintf(stderr, "HashTables\n");
+		for (size_t i = 0; i < n_readmap_threads; i++) {
+			ht_print(maps[i]);
+		}
+
+		// String Pools seem to be fine since they can grow in memory
+		/* fprintf(stderr, "StringPools:\n");
+		for (size_t i = 0; i < n_readmap_threads; i++) {
+			sp_print(str_pools[i]);
+		}
+		*/
 	}
 	//
 	// CLEAN

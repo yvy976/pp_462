@@ -73,3 +73,7 @@ int ht_insert(HashTable* ht, uint64_t hash, size_t val, StringPool* str_pool) {
 	fprintf(stderr, "WARNING Reach end of hash_table in ht_insert without inserting\n");
 	return 1;
 }
+
+void ht_print(HashTable* ht) {
+	fprintf(stderr, "\t# of Entries: %lu/%lu (%lf%%)\n\tTotal Word Count: %lu\n", ht->size, ht->capacity, (double) ht->size / ht->capacity, ht->total);
+}

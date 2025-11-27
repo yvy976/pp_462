@@ -75,3 +75,7 @@ size_t 		  sp_add(StringPool* sp, const char* str, size_t len) {
 char* sp_get(StringPool* sp, size_t offset) {
 	return sp->store + offset;
 }
+
+void sp_print(StringPool* sp) {
+	fprintf(stderr, "\t[SP] Used: %lu/%lu (%lf%%)\n\tWords: %lu\n", sp->used, sp->capacity, (double) sp->used / sp->capacity, sp->count);
+}

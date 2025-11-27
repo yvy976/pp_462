@@ -33,3 +33,5 @@ HashTable* ht_new(size_t capacity);
 // The hash is used to do true comparisons of the entries as well as
 // partially used to index the table.
 int ht_insert(HashTable* ht, uint64_t hash, size_t val, StringPool* str_pool);
+
+void ht_print(HashTable* ht);
