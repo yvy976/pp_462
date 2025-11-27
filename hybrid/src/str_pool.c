@@ -21,11 +21,11 @@ StringPool* sp_new(size_t capacity) {
 	StringPool* sp = malloc(sizeof(*sp));
 	if (!sp) return NULL;
 
-	sp->store = malloc(capacity);
+	sp->store = malloc(sizeof(*sp->store) * capacity);
 	if (!sp->store) { free(sp); return NULL; }
 
-	sp->store = 0;
 	sp->count = 0;
+	sp->used = 0;
 	sp->capacity = capacity;
 
 	return sp; 
@@ -46,20 +46,23 @@ static int _sp_resize(StringPool* sp, size_t new_capacity) {
 // Adds a string to the string pool
 // returns pointer to string or NULL on failure (not enough space to store string)
 // 'len' does NOT include the NULL terminator '\0'
-char* 		  sp_add(StringPool* sp, const char* str, size_t len) {
+size_t 		  sp_add(StringPool* sp, const char* str, size_t len) {
 	// Expand pool size if necessary
 	if (sp->used + len >= sp->capacity) {
 		size_t new_capacity = sp->capacity * 2;
 		if (len >= new_capacity - sp->capacity) {
 			fprintf(stderr, "[FATAL] irregularly large string len: %lu\n", len);
-			return NULL;
+			return -1;
 		}
-		_sp_resize(sp, new_capacity);
+		fprintf(stderr, "sp resizing to: %lu\n", new_capacity);
+		if (_sp_resize(sp, new_capacity))
+			fprintf(stderr, "WARNING _sp_resize failed for new capacity: %lu\n", new_capacity);
+
 	}
 
 	// copy in new string + NULL terminator
-	char* str_start = sp->store + sp->used;
-	memcpy(str_start, str, len);
+	size_t str_start = sp->used;
+	memcpy(sp->store + str_start, str, len);
 	sp->store[sp->used + len] = '\0';
 
 	// update stringpool fields
@@ -67,4 +70,8 @@ char* 		  sp_add(StringPool* sp, const char* str, size_t len) {
 	sp->count += 1;
 
 	return str_start;
+}
+
+char* sp_get(StringPool* sp, size_t offset) {
+	return sp->store + offset;
 }

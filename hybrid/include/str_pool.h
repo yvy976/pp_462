@@ -15,4 +15,5 @@ StringPool* sp_new(size_t capacity);
 
 // Adds a string to the string pool
 // returns pointer to string or NULL on failure (not enough space to store string)
-char* 		  sp_add(StringPool* sp, const char* str, size_t len);
+size_t 		  sp_add(StringPool* sp, const char* str, size_t len);
+char*				sp_get(StringPool* sp, size_t offset);
