@@ -1,6 +1,0 @@
-File: text_inputs/random_100000.txt
-Threads: 1
-Total Time: 0.139908
-Total: 100000 Unique: 99588
-Batch Size: 128
-

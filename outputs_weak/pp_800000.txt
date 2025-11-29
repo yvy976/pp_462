@@ -1,6 +1,0 @@
-File: ./text_inputs/random_800000.txt
-Threads: 8
-Total Time:  0.549219
-Total: 800000 Unique: 773645
-Batch Size: 128
-

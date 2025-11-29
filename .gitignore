@@ -1,0 +1,5 @@
+test*
+.cache/
+*.o
+bin/
+compile_commands.json

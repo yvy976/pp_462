@@ -1,9 +1,0 @@
-Reader. Time: 0.136157
-Mapper. Time: 0.313907
-Aggr. Time: 2.025956
-File: ./text_inputs/random_3200000.txt
-Threads: 32
-Total Time:  2.488143
-Total: 3200000 Unique: 2805448
-Batch Size: 128
-
