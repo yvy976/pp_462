@@ -2,14 +2,18 @@
 #include <stdlib.h>
 #include <omp.h>
 #include <mpi.h>
+#include <pthread.h>
+#include <string.h>
+#include <time.h>
 
 #include "fnv_hash.h"
 #include "hashtable.h"
 #include "str_pool.h"
+#include "double_table.h"
 
 
-#define GLOBAL_STRIPE_SIZE 		 (1 << 6)
-#define GLOBAL_HT_CAPACITY_MUL (1 << 4)		// Defines a multiplier for the global
+#define GLOBAL_STRIPE_SIZE 		 (1 << 1)
+#define GLOBAL_HT_CAPACITY_MUL (1 << 8)		// Defines a multiplier for the global
 																					// map size as a multiple of PER THREAD
 																					// map sizes (HT_CAPACITY / N_THREADS)
 
@@ -22,15 +26,31 @@
 																					// map's string pool as a multiple of PER THREAD
 																					// String Pool sizes
 
-#define SP_CAPACITY (1 << 20)							// Total SP Capacity for all threads combined
+#define SP_CAPACITY (1 << 26)							// Total SP Capacity for all threads combined
 																					// BYTES
 
-enum ReadState {
-	CONSUME,			// consume whitespace
-	PROCESS				// process word
+enum command_t {
+	WORK, DIE
 };
 
-inline char to_lower(char c) {
+typedef struct GlobalMapData {
+	char* file_name;
+	enum command_t command;
+	size_t done;
+	size_t working;
+	size_t t_ht_capacity;
+	size_t t_sp_capacity;
+	size_t n_mapper;
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
+} GlobalMapData;
+
+typedef struct LocalMapData {
+	size_t start;
+	size_t end;
+} LocalMapData;
+
+static inline char to_lower(char c) {
 	return ('a' - 'A') | c;
 }
 
@@ -43,12 +63,12 @@ int is_alphanum(char c) {
 	return alpha || num;
 }
 
-size_t align_word(FILE* f, size_t initial_start, size_t filesize) {
+static size_t align_word(FILE* f, size_t initial_start, size_t filesize) {
     fseek(f, initial_start, SEEK_SET);
     int c;
 
     // Skip until next whitespace
-		while (1) {
+		while (1) {	
 				if ((c = fgetc(f)) != EOF && is_alphanum(c)) {
 					initial_start += 1;
 					if (initial_start >= filesize) return filesize;
@@ -66,7 +86,7 @@ size_t align_word(FILE* f, size_t initial_start, size_t filesize) {
 }
 
 // calculates starts on word boundaries
-void calculate_start_offsets(FILE* f, size_t filesize, size_t* file_offsets, size_t n_chunks) {
+static void calculate_start_offsets(FILE* f, size_t filesize, size_t* file_offsets, size_t n_chunks) {
 	// offset for chunk 0
 	file_offsets[0] = 0;
 	int c;
@@ -80,185 +100,181 @@ void calculate_start_offsets(FILE* f, size_t filesize, size_t* file_offsets, siz
 	}
 }
 
-int map_reduce(size_t file_count, char** file_names) {
-	//
-	// PHASE 1
-	//
-	const size_t n_readmap_threads = (size_t) omp_get_max_threads();
-	const size_t t_ht_capacity = HT_CAPACITY / n_readmap_threads;			// PER THREAD HT Capacity
-	const size_t t_sp_capacity = SP_CAPACITY / n_readmap_threads; 		// PER THREAD SP Capacity
-	const size_t g_ht_capacity = t_ht_capacity * GLOBAL_HT_CAPACITY_MUL;
-	const size_t g_sp_capacity = t_sp_capacity * GLOBAL_SP_CAPACITY_MUL;
-	
-	double alloc_start, alloc_end;
-	
-	fprintf(stderr, "Allocating Data\n");
-	alloc_start = MPI_Wtime();
-
-	// Per Thread Data Arrays
-	size_t* file_offsets = malloc(sizeof(size_t) * n_readmap_threads);
-	HashTable** maps = malloc(sizeof(void*) * n_readmap_threads);
-
-	// Allocate Maps
-	for (size_t i = 0; i < n_readmap_threads; i++) {
-		if (!(maps[i] = ht_new(t_ht_capacity, t_sp_capacity, 0)))
-				{ fprintf(stderr, "Failed to allocate hashtable for %lu\n", i); return 1; } 
+static void map_thread(GlobalMapData* gmd, LocalMapData* lmd) {
+	HashTable local_ht;
+	if (ht_init(&local_ht, gmd->t_ht_capacity, gmd->t_sp_capacity, 0)) {
+		fprintf(stderr, "Thread: %u failed to allocate hashtable\n", omp_get_thread_num());
+		return; 
 	}
-
-	// Allocate Process Data
-	HashTable* g_map_ht = ht_new(g_ht_capacity, g_sp_capacity, GLOBAL_STRIPE_SIZE);
-	if (!g_map_ht) { fprintf(stderr, "Failed to allocate global map\n"); return 1; }
-
-
-	alloc_end = MPI_Wtime();
-
-	fprintf(stderr, "It took %lf seconds to allocate data\n", alloc_end - alloc_start);
 	
-	//
-	// PHASE 2
-	//
+	pthread_mutex_lock(&gmd->mutex);
+	while(1) {
+		pthread_cond_wait(&gmd->cond, &gmd->mutex);
+		#pragma omp atomic
+		gmd->working += 1;
+
+		pthread_mutex_unlock(&gmd->mutex);
+		if (gmd->command == DIE) break;
 	
-	for (size_t i = 0; i < file_count; i++) { 
+		size_t start = lmd->start;
+		size_t end = lmd->end; // this will be calculated by the coordinator thread now
+		//size_t end = (j == n_readlocal_ht_threads - 1) ? filesize : file_offsets[j + 1];
 		//
-		// First file pass for information and chunk boundaries
+		FILE* f = fopen(gmd->file_name, "rb");
+		if (!f) { fprintf(stderr, "Failed to open file %s on iteration %u\n", gmd->file_name, omp_get_thread_num()); continue; }
+		fseek(f, start, SEEK_SET);
+
+		size_t len = 0;
+		char buf[READBUFSIZE];
+		int c = fgetc(f);
+		
 		//
-		const char* file_name = file_names[i];
+		// PARSING/READING/MAPPING LOOP
+		//
+		double read_start, read_end;
+		read_start = omp_get_wtime();
+
+		for (size_t offset = start; offset < end && c != EOF; offset++, c = fgetc(f)) {
+			if (!is_alphanum(c)) {
+				if (len > 0)
+					{ ht_insert(&local_ht, fnv_hash(buf, len), buf, len); len = 0; }
+			}
+			else if (len == READBUFSIZE)
+				{ ht_insert(&local_ht, fnv_hash(buf, len), buf, len); len = 0; }
+			else
+				buf[len++] = c;
+		}
+
+		read_end = omp_get_wtime();
+		fprintf(stderr, "Thread %u took %lf seconds to readlocal_ht to local table\n", omp_get_thread_num(), read_end - read_start);
+
+		fclose(f);		
+
+		// do work
+		#pragma omp atomic
+		gmd->done += 1;
+
+		fprintf(stderr, "thread %u printing hashtable:\n", omp_get_thread_num());
+		ht_print(&local_ht);
+	}
+}
+
+static void coordinator_thread(int n_files, char** file_names, GlobalMapData* gmd, LocalMapData* lmd) {
+	size_t* file_offsets = malloc(sizeof(size_t) * gmd->n_mapper);
+
+	// for now:
+	for (int i = 0; i < n_files; i++) {
+		char* file_name = file_names[i];
 		fprintf(stderr, "Attempting file: %s\n", file_name);
 
-		FILE* f = fopen(file_name, "r");
-		if (!f) { fprintf(stderr, "Failed to open file %s\n", file_name); return 1; }
+		FILE* f = fopen(file_name, "rb");
+		if (!f) { fprintf(stderr, "Failed to open file %s\n", file_name); return; }
 		
 		// Get file size
-		if (fseek(f, 0, SEEK_END) == -1) { fprintf(stderr, "Failed to seek to end\n"); return 1; }
+		if (fseek(f, 0, SEEK_END) == -1) { fprintf(stderr, "Failed to seek to end\n"); return; }
 		const size_t filesize = ftell(f);
-		if (filesize == (size_t) -1) { fprintf(stderr, "Failed to fseek\n"); return 1; }
-		if (fseek(f, 0, SEEK_SET) == -1) { fprintf(stderr, "Failed to seek back to beginning\n"); return 1; }
+		if (filesize == (size_t) -1) { fprintf(stderr, "Failed to fseek\n"); return; }
+		if (fseek(f, 0, SEEK_SET) == -1) { fprintf(stderr, "Failed to seek back to beginning\n"); return; }
 
 		// Calculate offsets on word boundaries
-		calculate_start_offsets(f, filesize, file_offsets, n_readmap_threads);
-
+		calculate_start_offsets(f, filesize, file_offsets, gmd->n_mapper);
 		fclose(f);
-
-		//
-		// PHASE 2.1
-		//
 		
-		double readmap_start, readmap_end;
-
-		readmap_start = MPI_Wtime();
-		#pragma omp parallel for
-		for (size_t j = 0; j < n_readmap_threads; j++) {
-			HashTable* map = maps[j];
-			size_t start = file_offsets[j];
-			size_t end = (j == n_readmap_threads - 1) ? filesize : file_offsets[j + 1];
-
-			FILE* f = fopen(file_name, "r");
-			if (!f) { fprintf(stderr, "Failed to open file %s on iteration %lu\n", file_name, j); continue; }
-			fseek(f, start, SEEK_SET);
-
-			size_t len = 0;
-			char buf[READBUFSIZE];
-			enum ReadState state = PROCESS;
-			int c = fgetc(f);
-			
-			//
-			// PARSING/READING/MAPPING LOOP
-			//
-			for (size_t offset = start; offset < end && c != EOF; offset++, c = fgetc(f)) {
-				switch (state) {
-					case PROCESS:
-						if (!is_alphanum(c) || len == READBUFSIZE) {	// INSERT WORD
-							ht_insert(map, fnv_hash(buf, len), buf, len);
-							len = 0;
-							fseek(f, -1, SEEK_CUR);
-							offset -= 1;
-							state = CONSUME;
-						} else {
-							buf[len++] = c;
-						}
-						break;
-					case CONSUME:
-						if (is_alphanum(c)) {
-							fseek(f, -1, SEEK_CUR);
-							offset -= 1;
-							state = PROCESS;
-						}
-						break;
-				}
-			}
-
-			fclose(f);
-			
-			//
-			// AGGREGATE Thread-Local Maps to Global Map
-			//
-			/*	
-			double aggregate_start, aggregate_end;
-
-			aggregate_start = MPI_Wtime();
-			
-			for (size_t entries = 0; entries < maps[i]->capacity; entries++) {
-				//fprintf(stderr, "%lu\n", i);
-				HashEntry* entry = maps[i]->entries + entries;
-				if (!entry->count) continue;
-				
-				char* old_sp_offset = sp_get(maps[i]->sp, entry->sp_offset);
-				ht_locked_insert(g_map_ht, entry->hash, old_sp_offset, entry->len);
-			}
-
-			aggregate_end = MPI_Wtime();
-
-			fprintf(stderr, "Aggregate took thread %lu, %lf seconds.\n", i, aggregate_end - aggregate_start);
-			*/
+		lmd[0].start = 0;
+		for (size_t i = 1; i < gmd->n_mapper; i++) {
+			lmd[i - 1].end = file_offsets[i];
+			lmd[i].start = file_offsets[i];
 		}
-		readmap_end = MPI_Wtime();
+		lmd[gmd->n_mapper - 1].end = filesize;
+		
+		// set final global data
+		gmd->file_name = file_name;
 
-		fprintf(stderr, "ReadMap took %lf seconds.\n", readmap_end - readmap_start);
-
-		// DEBUG STATS
-		fprintf(stderr, "HashTables\n");
-		for (size_t i = 0; i < n_readmap_threads; i++) {
-			ht_print(maps[i]);
+		// broadcast
+		while(gmd->working != gmd->n_mapper) {
+			pthread_cond_broadcast(&gmd->cond);
+			nanosleep(&(struct timespec) { 0, 100000 }, NULL);
+		}
+		
+		// check incoming file requests here but just rest for now
+		while (gmd->done != gmd->n_mapper) {
+			nanosleep(&(struct timespec) { 0, 100000 }, NULL);
 		}
 
-		fprintf(stderr, "GLOBAL HashTable:\n");
-		ht_print(g_map_ht);
+		// reset counter states
+		gmd->working = 0;
+		gmd->done = 0;
 
-		// String Pools seem to be fine since they can grow in memory
-		fprintf(stderr, "StringPools:\n");
-		for (size_t i = 0; i < n_readmap_threads; i++) {
-			sp_print(maps[i]->sp);
-		}
-
-		fprintf(stderr, "GLOBAL StringPool: (Doens't Have Locking RN)\n");
-		sp_print(g_map_ht->sp);
-
-		ht_clear(maps[i]);
+		fprintf(stderr, "mapper threads finished\n");
 	}
-	//
-	// CLEAN
-	//
+
+	gmd->command = DIE;
+	while (gmd->working != gmd->n_mapper) {	
+		pthread_cond_broadcast(&gmd->cond);
+		nanosleep(&(struct timespec) { 0, 100000 }, NULL);
+	}
 	
-	for (size_t i = 0; i < n_readmap_threads; i++) {
-		ht_free(maps[i]);
-	}
-	free(maps);
-	free(file_offsets); 
-	return 0;
-}
+	fprintf(stderr, "exiting coordinator\n");
+
+	free(file_offsets);
+} 
 
 int main(int argc, char** argv) {
 	if (argc < 2) {
 		fprintf(stderr, "Usage: wc [FILE1] [FILE2] [FILE{n}...]\n");
 		return 0;
 	}
+
+	if (omp_get_max_threads() < 3) {
+		fprintf(stderr, "atleast 3 threads required\n");
+		return 1;
+	}
+
+	const size_t available = omp_get_max_threads() - 1;
+	const size_t n_mapper = available / 2;
+	const size_t n_reducer = available - n_mapper;
 	
+	GlobalMapData gmd = {
+		.file_name = NULL,
+		.command = WORK,
+		.t_ht_capacity = HT_CAPACITY / n_mapper,
+		.t_sp_capacity = SP_CAPACITY / n_mapper,
+		.n_mapper = n_mapper,
+		.mutex = PTHREAD_MUTEX_INITIALIZER,
+		.cond = PTHREAD_COND_INITIALIZER,
+		.done = 0,
+	};
+
+	LocalMapData* lmd = malloc(sizeof(LocalMapData) * n_mapper);
+	if (!lmd) { fprintf(stderr, "Failed to allcoate MapData array\n"); return 1; }
+
+	HashTable reduce_ht;
+	if (ht_init(&reduce_ht, HT_CAPACITY, SP_CAPACITY, 1)) { free(lmd); fprintf(stderr, "Failed to allcoate reduce table\n"); return 1; }
+
 	double start, stop;
-	start = MPI_Wtime();
+	start = omp_get_wtime();
 
-	map_reduce(argc - 1, argv + 1);
+	#pragma omp parallel
+	{
+		#pragma omp single
+		{
+			for (size_t i = 0; i < n_mapper; i++) {
+				#pragma omp task
+				map_thread(&gmd, lmd);
+			}
 
-	stop = MPI_Wtime();
+			for (size_t i = 0; i < n_reducer; i++) {
+				#pragma omp task
+				fprintf(stderr, "spawn a reducer thread here\n");
+			}
+
+			coordinator_thread(argc - 1, argv + 1, &gmd, lmd);
+		}
+	}
+
+	// map_reduce(argc - 1, argv + 1);
+
+	stop = omp_get_wtime();
 
 	fprintf(stderr, "Total Time: %lf\n", stop - start);
 }
