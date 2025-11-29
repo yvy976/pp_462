@@ -250,7 +250,6 @@ int main(int argc, char **argv) {
     // logarithmic parallel aggregation
     int step = 1;
     while (step < nt) {
-        #pragma omp parallel for
         for (int i = 0; i + step < nt; i += step << 1) {
             mergeHashMapsParallel(local_maps[i], local_maps[i + step], TABLE_SIZE, TABLE_SIZE / nt);
         }

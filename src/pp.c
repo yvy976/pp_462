@@ -89,7 +89,6 @@ int Dequeue(Queue *q, Task **out_tasks) {
     return i;
 }
 
-/* Murmur-ish hash from your code (keeps mod at end) */
 unsigned long long _Hash_bytes(const void *ptr, size_t len, size_t seed, size_t modValue) {
     const size_t m = 0x5bd1e995;
     unsigned long long hash = seed ^ len;
@@ -230,7 +229,6 @@ int main(int argc, char **argv) {
                 if (done == nt) break;
                 continue;
             }
-#pragma omp parallel for
             for (int i = 0; i < got; ++i) {
                 Task *t = batch[i];
                 unsigned int idx = hash(t->word, (size_t)t->len, (size_t)read_size);
@@ -257,7 +255,6 @@ int main(int argc, char **argv) {
         // Aggregate local map into global_map
 #pragma omp barrier
         double agg_start = omp_get_wtime();
-#pragma omp parallel for
         for (int i = 0; i < read_size; ++i)
          {
             if (map->iarr[i] == NULL) continue;
@@ -272,15 +269,15 @@ int main(int argc, char **argv) {
                     global_map->iarr[cur] = strdup(word);
                     global_map->buckets[cur] = word_count;
                     omp_unset_lock(&global_map->locks[lock_idx]);
-   //                #pragma omp atomic
+                 //  #pragma omp atomic
                     global_map->unique_word_count += 1;
-    //               #pragma omp atomic
+                  // #pragma omp atomic
                     global_map->total_word_count += word_count;
                     break;
                 } else if (strcmp(global_map->iarr[cur], word) == 0) {
                     global_map->buckets[cur] += word_count;
                     omp_unset_lock(&global_map->locks[lock_idx]);
-      //             #pragma omp atomic
+                  // #pragma omp atomic
                     global_map->total_word_count += word_count;
                     break;
                 } else {
