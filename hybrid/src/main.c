@@ -220,7 +220,7 @@ static void flush_to_global(HashTable* local_ht, GlobalMapData* gmd) {
 
 		map_flush_end = omp_get_wtime();
 
-		fprintf(stderr, "It took %lf to flush local to global\n", map_flush_end - map_flush_start);
+		// fprintf(stderr, "It took %lf to flush local to global\n", map_flush_end - map_flush_start);
 }
 
 static void map_thread(GlobalMapData* gmd, LocalMapData* lmd) {
@@ -296,7 +296,7 @@ static void map_thread(GlobalMapData* gmd, LocalMapData* lmd) {
 		}
 
 		read_end = omp_get_wtime();
-		fprintf(stderr, "Thread %u took %lf seconds to read %lu words to local table\n", omp_get_thread_num(), read_end - read_start, count);
+		// fprintf(stderr, "Thread %u took %lf seconds to read %lu words to local table\n", omp_get_thread_num(), read_end - read_start, count);
 
 		fclose(f);
 			if ((double) local_ht.size > (double) local_ht.capacity * FLUSH_THRESHOLD ||
