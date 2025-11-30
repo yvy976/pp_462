@@ -143,22 +143,20 @@ int ht_locked_insert(HashTable* ht, uint64_t hash, const char* str, size_t len, 
 			
 			#pragma omp atomic
 			ht->n_reference -= 1;
+
 			return 0;
 		}
 		else if (e->hash != hash) { omp_unset_lock(&ht->locks[stripe_id]); continue; }
 		else if (strcmp(str, sp_get(ht->sp, e->sp_offset))) {
+			omp_unset_lock(&ht->locks[stripe_id]);
 			#pragma omp atomic
 				ht->true_coll += 1;
-			omp_unset_lock(&ht->locks[stripe_id]);
 			continue;
 		}
 		else {
-			omp_unset_lock(&ht->locks[stripe_id]);
-			#pragma omp atomic
 			e->count += count;
-
-			#pragma omp atomic
 			ht->total += count;
+			omp_unset_lock(&ht->locks[stripe_id]);
 
 			#pragma omp atomic
 			ht->n_reference -= 1;
