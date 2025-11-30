@@ -128,10 +128,10 @@ unsigned long long _Hash_bytes(const void *ptr, size_t len, size_t seed, size_t 
     {
     case 3:
         hash ^= (unsigned char)(buf[2]) << 16;
-        [[gnu::fallthrough]];
+        /* FALLTHROUGH */
     case 2:
         hash ^= (unsigned char)(buf[1]) << 8;
-        [[gnu::fallthrough]];
+        /* FALLTHROUGH */
     case 1:
         hash ^= (unsigned char)(buf[0]);
         hash *= m;

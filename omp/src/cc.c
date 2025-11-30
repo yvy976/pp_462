@@ -104,8 +104,8 @@ unsigned long long _Hash_bytes(const void *ptr, size_t len, size_t seed, size_t 
         len -= 4;
     }
     switch (len) {
-        case 3: hash ^= (unsigned long long)buf[2] << 16; [[fallthrough]];
-        case 2: hash ^= (unsigned long long)buf[1] << 8; [[fallthrough]];
+        case 3: hash ^= (unsigned long long)buf[2] << 16; /* FALLTHROUGH */
+        case 2: hash ^= (unsigned long long)buf[1] << 8; /* FALLTHROUGH */
         case 1: hash ^= (unsigned long long)buf[0]; hash *= m;
     }
     hash ^= hash >> 13;
