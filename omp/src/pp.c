@@ -195,6 +195,7 @@ int main(int argc, char **argv) {
    HashMap *global_map = createHashMap(TABLE_SIZE, TABLE_SIZE);
 #pragma omp parallel shared(done)
     {
+      double start_local_time = omp_get_wtime();
         int tid = omp_get_thread_num();
         // per-thread private map. Use int cast but ensure not overflow.
         HashMap *map = createHashMap(read_size, 0);
@@ -286,14 +287,17 @@ int main(int argc, char **argv) {
                 }
             }
         }
+double end_local_time = omp_get_wtime();
         double agg_end = omp_get_wtime();
-
+      
     end_time = omp_get_wtime();
-#pragma omp single
+#pragma omp critical
         {
-            printf("Reader. Time: %f\n", reader_end - reader_start);
-            printf("Mapper. Time: %f\n", mapper_end - mapper_start);
-            printf("Aggr. Time: %f\n", agg_end - agg_start);
+        printf("%d %f\n",omp_get_thread_num(), end_local_time - start_local_time);
+         //   printf("Reader. Time: %f\n", reader_end - reader_start);
+         //   printf("Mapper. Time: %f\n", mapper_end - mapper_start);
+         //   printf("Aggr. Time: %f\n", agg_end - agg_start);
+            
         }
 
         // cleanup per-thread
