@@ -9,7 +9,6 @@
 #include "fnv_hash.h"
 #include "hashtable.h"
 #include "str_pool.h"
-#include "double_table.h"
 
 #define GLOBAL_STRIPE_SIZE 		 (1 << 6)
 #define GLOBAL_HT_CAPACITY_MUL (1 << 8)		// Defines a multiplier for the global
@@ -33,9 +32,9 @@
 #define RD_SP_CAPACITY (1 << 26)						
 
 #define SENDWORD_CAPACITY (1 << 6)
-#define SENDBUF_CAPACITY (1 << 10)
+#define SENDBUF_CAPACITY (1 << 20)
 
-#define FLUSH_THRESHOLD 0.50
+#define FLUSH_THRESHOLD 0.80
 
 int rank, world_size;
 
@@ -47,6 +46,8 @@ typedef struct GlobalMapData GlobalMapData;
 typedef struct LocalMapData LocalMapData;
 typedef struct SendEntry SendEntry;
 typedef struct SendBuf SendBuf;
+typedef struct RecvBuf RecvBuf;
+typedef struct RecvData RecvData;
 
 struct GlobalMapData {
 	char* file_name;
@@ -56,10 +57,12 @@ struct GlobalMapData {
 	size_t t_ht_capacity;
 	size_t t_sp_capacity;
 	size_t n_mapper;
+	size_t n_reducer;
 	pthread_mutex_t mutex;
 	pthread_cond_t cond;
 	HashTable* g_ht;
 	SendBuf* sb;
+	RecvData* recv_data;
 };
 
 struct LocalMapData {
@@ -88,6 +91,17 @@ struct SendBuf {
 	size_t buf_capacities;
 	SendEntry** process_buffers;
 
+};
+
+struct RecvBuf {
+	size_t size;
+	size_t capacity;
+	SendEntry* buffer;
+};
+
+// There needs to be a way to communicate with the thread
+struct RecvData {
+	enum command_t command;
 };
 
 static inline char to_lower(char c) {
@@ -196,19 +210,21 @@ static void map_thread(GlobalMapData* gmd, LocalMapData* lmd) {
 		pthread_cond_wait(&gmd->cond, &gmd->mutex);
 		int rank;
 		MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-		fprintf(stderr, "rank %d map thread %u got signaled: %d\n", rank, omp_get_thread_num(), gmd->command);
+		// fprintf(stderr, "rank %d map thread %u got signaled: %d\n", rank, omp_get_thread_num(), gmd->command);
 		pthread_mutex_unlock(&gmd->mutex);
 
 		#pragma omp atomic
 		gmd->working += 1;
 
 		if (gmd->command == DIE) {
-			fprintf(stderr, "map flushing before death\n");
+			fprintf(stderr, "rank: %d map flushing before death\n", rank);
 
 			flush_to_global(&local_ht, gmd);
 
 			#pragma omp atomic
 			gmd->done += 1;
+
+			fprintf(stderr, "mapper %u exited\n", omp_get_thread_num());
 			break;
 		}
 		fprintf(stderr, "processing file: %s\n", gmd->file_name);
@@ -261,8 +277,8 @@ static void map_thread(GlobalMapData* gmd, LocalMapData* lmd) {
 		#pragma omp atomic
 		gmd->done += 1;
 
-		fprintf(stderr, "thread %u printing hashtable:\n", omp_get_thread_num());
-		ht_print(&local_ht);
+		// fprintf(stderr, "thread %u printing hashtable:\n", omp_get_thread_num());
+		// ht_print(&local_ht);
 
 		// clear local table
 		// ht_clear(&local_ht);
@@ -281,16 +297,32 @@ static void send_thread(GlobalMapData* gmd) {
 		
 		#pragma omp atomic
 		sb->working += 1;
+		
+		// flush sends before death
+		if (sb->command == DIE) {
+			for (size_t i = 0; i < sb->n_dests; i++) {
+				size_t size = sb->buf_sizes[i];
+				fprintf(stderr, "rank %d sending to proc %ld: %lu entries\n", rank, i, size);
+				if (!size || i == (size_t) rank) continue;
 
-		if (sb->command == DIE) break;
+				fprintf(stderr, "MPI SEND CALL: buf: %p, bytes: %lu (%lu entries), to: %lu\n", sb->process_buffers[i], sizeof(SendEntry) * size, size, i);
+				MPI_Send(sb->process_buffers[i], sizeof(SendEntry) * size, MPI_BYTE, i, 3, MPI_COMM_WORLD); 
+			}
+			#pragma omp atomic
+				sb->working += 1;
+			
+			fprintf(stderr, "send_thread exiting\n");
+			break;
+		} else {
+			#pragma omp atomic
+				sb->working += 1;
+		}
 
 		// swap
 		
 		HashTable* tmp = gmd->g_ht;
-		
 		#pragma omp atomic write
-			gmd->g_ht = sb->table;
-		
+			gmd->g_ht = sb->table;	
 		sb->table = tmp;
 
 		// flush
@@ -300,24 +332,25 @@ static void send_thread(GlobalMapData* gmd) {
 		while (table->n_reference > 0) {	
 			nanosleep(&(struct timespec) { 0, 100000 }, NULL);
 		}
-
-		while (1) {};
-
+		
+		// attempting to send
+		fprintf(stderr, "attempting to flush: %lu entries\n", table->size);
 		for (size_t i = 0, count = 0; i < table->capacity && count < table->size; i++) {
 			HashEntry* entry = table->entries + i;
 			if (!entry->count) continue;
 			
 			size_t proc = entry->hash % sb->n_dests;
+			// fprintf(stderr, "hash: %lx, str: %.*s, dest proc: %lu\n", entry->hash, (int)entry->len, sp_get(table->sp, entry->sp_offset), proc);
 			if (proc == (size_t) rank) {
-				fprintf(stderr, "send to local reduce\n");
+				// fprintf(stderr, "send to local reduce\n");
 				continue;
 			}
 			SendEntry* buf = sb->process_buffers[proc];
 
 			if (sb->buf_sizes[proc] == sb->buf_capacities) {
-				fprintf(stderr, "attempting send to: %lu\n", proc);
+				fprintf(stderr, "ATTEMPTING SEND from buffer: %p, bytes: %lu (%lu entries), to proc: %lu\n", buf, sb->buf_capacities * sizeof(SendEntry), sb->buf_capacities, proc);
 
-				MPI_Send(buf, sizeof(SendBuf) * sb->buf_capacities, MPI_CHAR, proc, 3, MPI_COMM_WORLD); 
+				MPI_Send(buf, sizeof(SendEntry) * sb->buf_capacities, MPI_BYTE, proc, 3, MPI_COMM_WORLD); 
 				sb->buf_sizes[proc] = 0;
 			}
 			buf += sb->buf_sizes[proc];
@@ -326,7 +359,12 @@ static void send_thread(GlobalMapData* gmd) {
 			buf->count = entry->count;
 			buf->hash = entry->hash;
 			buf->len = entry->len;
-			strncpy(buf->str, sp_get(sb->table->sp, entry->sp_offset), SENDBUF_CAPACITY);
+
+			if (buf->len >= SENDWORD_CAPACITY) {
+				fprintf(stderr, "INTERETING CATCH hash entry with len: %lu\n", buf->len);
+			}
+
+			strncpy(buf->str, sp_get(sb->table->sp, entry->sp_offset), entry->len);
 
 			sb->buf_sizes[proc] += 1;
 
@@ -340,6 +378,39 @@ static void send_thread(GlobalMapData* gmd) {
 	}
 
 	fprintf(stderr, "send buf exiting\n");
+}
+
+static void recieve_thread(HashTable* reducer_table, RecvBuf* rb, RecvData* rd) {
+	int flag;
+	int size;
+	MPI_Status s;
+	MPI_Message m;
+
+	while (1) {
+		// Probe for message
+		MPI_Improbe(MPI_ANY_SOURCE, 3, MPI_COMM_WORLD, &flag, &m, &s);
+
+		if (flag) {
+			MPI_Get_count(&s, MPI_BYTE, &size);
+			if ((size_t) size > SENDBUF_CAPACITY * sizeof(SendEntry)) {
+				fprintf(stderr, "WARNING: incoming message is larger than expected!\n"); 
+			} 
+		
+			fprintf(stderr, "RECIEVING\n");
+			MPI_Mrecv(rb->buffer, size, MPI_BYTE, &m, MPI_STATUS_IGNORE);
+			fprintf(stderr, "recieved %d bytes (%ld entries) from process %d\n", size, size / sizeof(SendEntry), s.MPI_SOURCE);
+			for (int i = 0; i < size; i++) {
+				SendEntry* entry = rb->buffer;
+				// fprintf(stderr, "Recieved entry: %x | %.*s (%lu)\n", (unsigned int)entry->hash, (int) entry->len, entry->str, entry->len);
+				ht_locked_insert(reducer_table, entry->hash, entry->str, entry->len, entry->count);
+			} 
+		} else if (rd->command == DIE) {
+			fprintf(stderr, "recieve %u thread exiting\n", omp_get_thread_num());
+			break;
+		} else {
+			nanosleep(&(struct timespec) { 0, 100000 }, NULL);
+		}
+	}
 }
 
 static void coordinator_thread(int n_files, char** file_names, GlobalMapData* gmd, LocalMapData* lmd) {
@@ -394,19 +465,33 @@ static void coordinator_thread(int n_files, char** file_names, GlobalMapData* gm
 
 		fprintf(stderr, "mapper threads finished\n");
 	}
-
+	
+	// signal mappers to flush and die
 	gmd->done = 0;
 	gmd->command = DIE;
 	while (gmd->done < gmd->n_mapper) {
 		pthread_cond_broadcast(&gmd->cond);
 		nanosleep(&(struct timespec) { 0, 100000 }, NULL);
 	}
-	
+
+	// flush the global table
+	if (gmd->g_ht->size > 0) {
+		flush_global(gmd);
+	}
+
+	// Kill the send thread after its done
 	sb->command = DIE;
 	sb->working = 0;
 	while (sb->working < 1) {	
 		pthread_cond_broadcast(&sb->cond);
 		nanosleep(&(struct timespec) { 0, 100000 }, NULL);
+	}
+	
+	MPI_Barrier(MPI_COMM_WORLD);
+			
+	// soft request the recieving threads
+	for (size_t i = 0; i < gmd->n_reducer; i++) {
+		gmd->recv_data[i].command = DIE;
 	}
 
 	fprintf(stderr, "exiting coordinator\n");
@@ -445,8 +530,7 @@ int main(int argc, char** argv) {
 
 	// global mapping table
 	HashTable g_ht;
-	if (ht_init(&g_ht, HT_CAPACITY, SP_CAPACITY, 1)) { free(lmd); fprintf(stderr, "Failed to allcoate reduce table\n"); return 1; }
-	
+	if (ht_init(&g_ht, HT_CAPACITY, SP_CAPACITY, 1)) { free(lmd); fprintf(stderr, "Failed to allcoate reduce table\n"); return 1; }	
 
 	// Initialize Send buffer
 	SendBuf sb;
@@ -479,6 +563,29 @@ int main(int argc, char** argv) {
 		if (!sb.process_buffers[i]) { fprintf(stderr, "Failed to allocate process buffer %lu for the process buffers\n", i); return 1; }
 	}
 
+	RecvBuf* recv_buffers = malloc(sizeof(RecvBuf) * n_reducer);
+	if (!recv_buffers) { fprintf(stderr, "Failed to allocate recv_buffers array\n"); return 1; }
+
+	// for n in number of reducers, allocate buffers
+	for (size_t i = 0; i < n_reducer; i++) {
+		RecvBuf* buf = recv_buffers + i;
+		buf->buffer = malloc(sizeof(SendEntry) * SENDBUF_CAPACITY);
+		if (!buf->buffer) { fprintf(stderr, "Failed to allocate the underlying buffer for recvbuf object for reducer: %lu\n", i); return 1;}
+		buf->size = 0;
+		buf->capacity = SENDBUF_CAPACITY;
+	}
+
+	RecvData* recv_data = malloc(sizeof(RecvData) * n_reducer);
+	for (size_t i = 0; i < n_reducer; i++) { 
+		recv_data[i].command = WORK;
+	}
+
+	HashTable reducer_table;
+	if (ht_init(&reducer_table, HT_CAPACITY / world_size, SP_CAPACITY / world_size, 1)) {
+		fprintf(stderr, "Failed to allocate reducer table\n");
+		return 1;
+	}
+
 	// global mapping data
 	GlobalMapData gmd = {
 		.file_name = NULL,
@@ -486,11 +593,13 @@ int main(int argc, char** argv) {
 		.t_ht_capacity = HT_CAPACITY / n_mapper,
 		.t_sp_capacity = SP_CAPACITY / n_mapper,
 		.n_mapper = n_mapper,
+		.n_reducer = n_reducer,
 		.mutex = PTHREAD_MUTEX_INITIALIZER,
 		.cond = PTHREAD_COND_INITIALIZER,
 		.done = 0,
 		.g_ht = &g_ht,
 		.sb = &sb, 
+		.recv_data = recv_data,
 	};
 
 	
@@ -510,25 +619,28 @@ int main(int argc, char** argv) {
 				#pragma omp task
 				map_thread(&gmd, lmd);
 			}
-
 			for (size_t i = 0; i < n_reducer; i++) {
 				#pragma omp task
-				fprintf(stderr, "spawn a reducer thread here\n");
+				recieve_thread(&reducer_table, recv_buffers + i, recv_data + i);
 			}
-
+			
 			coordinator_thread(argc - 1, argv + 1, &gmd, lmd);
-
+			
+			
 			fprintf(stderr, "Global Table Final: \n");
-			ht_print(gmd.g_ht); 
+			ht_print(gmd.g_ht);
+
 		}
 	}
 
-	// map_reduce(argc - 1, argv + 1);
-
 	stop = omp_get_wtime();
+	if (!rank)
+		fprintf(stderr, "Total Time: %lf\n", stop - start);
 
-	fprintf(stderr, "Total Time: %lf\n", stop - start);
+	fprintf(stderr, "rank: %u, CALLING MPI_FINALIZE\n", rank);
 
 	MPI_Finalize();
+
+	fprintf(stderr, "rank %u out\n", rank);
 }
 
