@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <omp.h>
 #include "str_pool.h"
 
 /*
@@ -9,6 +10,7 @@
 	size_t used;
 	size_t count;
 	size_t capacity;
+	omp_lock_t lock;
 };
 */
 
@@ -17,12 +19,15 @@ void sp_free(StringPool* sp) {
 	free(sp);
 }
 
-StringPool* sp_new(size_t capacity) {
+StringPool* sp_new(size_t capacity, int concurrent) {
 	StringPool* sp = malloc(sizeof(*sp));
 	if (!sp) return NULL;
 
 	sp->store = malloc(sizeof(char) * capacity);
 	if (!sp->store) { free(sp); return NULL; }
+	
+	if (concurrent)
+		omp_init_lock(&sp->lock);
 
 	sp->count = 0;
 	sp->used = 0;
@@ -52,11 +57,15 @@ size_t 		  sp_add(StringPool* sp, const char* str, size_t len) {
 		size_t new_capacity = (sp->used + len) * 2;
 		if (len >= new_capacity - sp->used) {
 			fprintf(stderr, "[FATAL] irregularly large string len: %lu\n", len);
-			return -1;
+
+			return 1;
 		}
 		fprintf(stderr, "sp resizing to: %lu\n", new_capacity);
-		if (_sp_resize(sp, new_capacity))
+		if (_sp_resize(sp, new_capacity)) {
 			fprintf(stderr, "WARNING _sp_resize failed for new capacity: %lu\n", new_capacity);
+
+			return 1;
+		}
 	}
 
 	// copy in new string + NULL terminator
@@ -64,9 +73,8 @@ size_t 		  sp_add(StringPool* sp, const char* str, size_t len) {
 	memcpy(sp->store + str_start, str, len);
 	sp->store[sp->used + len] = '\0';
 
-	// update stringpool fields
-	sp->used += len + 1;
 	sp->count += 1;
+	sp->used += len + 1;
 
 	return str_start;
 }

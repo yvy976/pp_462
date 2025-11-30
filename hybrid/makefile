@@ -1,5 +1,5 @@
 CC = mpicc
-CFLAGS = -fopenmp -Wall -Wextra -Iinclude -O3 -ggdb
+CFLAGS = -fopenmp -Wall -Wextra -Iinclude -O3 -flto -ggdb
 SRCS := $(wildcard src/*.c)
 TARGET = bin/wc
 

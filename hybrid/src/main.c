@@ -2,18 +2,20 @@
 #include <stdlib.h>
 #include <omp.h>
 #include <mpi.h>
+#include <pthread.h>
+#include <string.h>
+#include <time.h>
 
 #include "fnv_hash.h"
 #include "hashtable.h"
 #include "str_pool.h"
 
-
 #define GLOBAL_STRIPE_SIZE 		 (1 << 6)
-#define GLOBAL_HT_CAPACITY_MUL (1 << 4)		// Defines a multiplier for the global
+#define GLOBAL_HT_CAPACITY_MUL (1 << 8)		// Defines a multiplier for the global
 																					// map size as a multiple of PER THREAD
 																					// map sizes (HT_CAPACITY / N_THREADS)
 
-#define HT_CAPACITY (1 << 24)							// Total Capacity for all threads combined
+#define HT_CAPACITY (1 << 20)							// Total Capacity for all threads combined
 																					// (ENTRIES NOT BYTES)
 
 #define READBUFSIZE (1 << 6)							// BYTES
@@ -22,15 +24,88 @@
 																					// map's string pool as a multiple of PER THREAD
 																					// String Pool sizes
 
-#define SP_CAPACITY (1 << 20)							// Total SP Capacity for all threads combined
+#define SP_CAPACITY (1 << 26)							// Total SP Capacity for all threads combined
 																					// BYTES
 
-enum ReadState {
-	CONSUME,			// consume whitespace
-	PROCESS				// process word
+#define RD_HT_CAPACITY (1 << 28) 						// Reducer table capacity spread across all processes
+
+#define RD_SP_CAPACITY (1l << 32)						
+
+#define SENDWORD_CAPACITY (1 << 6)
+#define SENDBUF_CAPACITY (1 << 20)
+
+#define FLUSH_THRESHOLD 0.70
+
+int rank, world_size;
+
+enum command_t {
+	WORK, DIE
 };
 
-inline char to_lower(char c) {
+typedef struct GlobalMapData GlobalMapData;
+typedef struct LocalMapData LocalMapData;
+typedef struct SendEntry SendEntry;
+typedef struct SendBuf SendBuf;
+typedef struct RecvBuf RecvBuf;
+typedef struct RecvData RecvData;
+
+struct GlobalMapData {
+	char* file_name;
+	enum command_t command;
+	size_t done;
+	size_t working;
+	size_t t_ht_capacity;
+	size_t t_sp_capacity;
+	size_t n_mapper;
+	size_t n_reducer;
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
+	HashTable* g_ht;
+	SendBuf* sb;
+	RecvData* recv_data;
+};
+
+struct LocalMapData {
+	size_t start;
+	size_t end;
+};
+
+struct SendEntry {
+	size_t count;
+	uint64_t hash;
+	size_t len;
+	char str[SENDWORD_CAPACITY];
+};
+
+struct SendBuf {
+	int working;
+	int signal;
+	HashTable* table;
+	omp_lock_t table_lock;
+
+	enum command_t command;
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
+	
+	size_t n_dests;
+	size_t* buf_sizes;
+	size_t buf_capacities;
+	SendEntry** process_buffers;
+
+};
+
+struct RecvBuf {
+	size_t size;
+	size_t capacity;
+	SendEntry* buffer;
+};
+
+// There needs to be a way to communicate with the thread
+struct RecvData {
+	enum command_t command;
+};
+
+static inline char to_lower(char c) {
 	return ('a' - 'A') | c;
 }
 
@@ -43,12 +118,12 @@ int is_alphanum(char c) {
 	return alpha || num;
 }
 
-size_t align_word(FILE* f, size_t initial_start, size_t filesize) {
+static size_t align_word(FILE* f, size_t initial_start, size_t filesize) {
     fseek(f, initial_start, SEEK_SET);
     int c;
 
     // Skip until next whitespace
-		while (1) {
+		while (1) {	
 				if ((c = fgetc(f)) != EOF && is_alphanum(c)) {
 					initial_start += 1;
 					if (initial_start >= filesize) return filesize;
@@ -66,7 +141,7 @@ size_t align_word(FILE* f, size_t initial_start, size_t filesize) {
 }
 
 // calculates starts on word boundaries
-void calculate_start_offsets(FILE* f, size_t filesize, size_t* file_offsets, size_t n_chunks) {
+static void calculate_start_offsets(FILE* f, size_t filesize, size_t* file_offsets, size_t n_chunks) {
 	// offset for chunk 0
 	file_offsets[0] = 0;
 	int c;
@@ -80,186 +155,662 @@ void calculate_start_offsets(FILE* f, size_t filesize, size_t* file_offsets, siz
 	}
 }
 
-int map_reduce(size_t file_count, char** file_names) {
-	//
-	// PHASE 1
-	//
-	const size_t n_readmap_threads = (size_t) omp_get_max_threads();
-	const size_t t_ht_capacity = HT_CAPACITY / n_readmap_threads;			// PER THREAD HT Capacity
-	const size_t t_sp_capacity = SP_CAPACITY / n_readmap_threads; 		// PER THREAD SP Capacity
-	const size_t g_ht_capacity = t_ht_capacity * GLOBAL_HT_CAPACITY_MUL;
-	const size_t g_sp_capacity = t_sp_capacity * GLOBAL_SP_CAPACITY_MUL;
-	
-	double alloc_start, alloc_end;
-	
-	fprintf(stderr, "Allocating Data\n");
-	alloc_start = MPI_Wtime();
+static void try_flush_global(GlobalMapData* gmd) {
+	// fprintf(stderr, "atetmpting NONBLOCKING global frame: %p at %lu / %lu\n", (void*) gmd->g_ht, gmd->g_ht->size, gmd->g_ht->capacity);
 
-	// Per Thread Data Arrays
-	size_t* file_offsets = malloc(sizeof(size_t) * n_readmap_threads);
-	HashTable** maps = malloc(sizeof(void*) * n_readmap_threads);
-
-	// Allocate Maps
-	for (size_t i = 0; i < n_readmap_threads; i++) {
-		if (!(maps[i] = ht_new(t_ht_capacity, t_sp_capacity, 0)))
-				{ fprintf(stderr, "Failed to allocate hashtable for %lu\n", i); return 1; } 
+	SendBuf* sb = gmd->sb;
+	if (!omp_test_lock(&sb->table_lock)) {
+		return;
+	} else if (sb->working) {
+		omp_unset_lock(&sb->table_lock);
+		return;
+	}
+	// notify the send thread
+	// maybe do this more than once?
+	sb->working = 1;
+	sb->signal = 0; 
+	while (sb->signal < 1) {	
+		pthread_cond_broadcast(&sb->cond);
+		nanosleep(&(struct timespec) { 0, 100000 }, NULL);
 	}
 
-	// Allocate Process Data
-	HashTable* g_map_ht = ht_new(g_ht_capacity, g_sp_capacity, GLOBAL_STRIPE_SIZE);
-	if (!g_map_ht) { fprintf(stderr, "Failed to allocate global map\n"); return 1; }
+	omp_unset_lock(&sb->table_lock);
+}
 
+static void flush_global(GlobalMapData* gmd) {
+	fprintf(stderr, "atetmpting BLOCKING FLUSH global frame: %p at %lu / %lu\n", (void*) gmd->g_ht, gmd->g_ht->size, gmd->g_ht->capacity);
 
-	alloc_end = MPI_Wtime();
-
-	fprintf(stderr, "It took %lf seconds to allocate data\n", alloc_end - alloc_start);
+	SendBuf* sb = gmd->sb;
+	omp_set_lock(&sb->table_lock);
 	
-	//
-	// PHASE 2
-	//
-	
-	for (size_t i = 0; i < file_count; i++) { 
-		//
-		// First file pass for information and chunk boundaries
-		//
-		const char* file_name = file_names[i];
-		fprintf(stderr, "Attempting file: %s\n", file_name);
+	// notify the send thread
+	// maybe do this more than once?
+	sb->signal = 0;
+	while (sb->signal < 1) {	
+		pthread_cond_broadcast(&sb->cond);
+		nanosleep(&(struct timespec) { 0, 100000 }, NULL);
+	}
 
-		FILE* f = fopen(file_name, "r");
-		if (!f) { fprintf(stderr, "Failed to open file %s\n", file_name); return 1; }
+	omp_unset_lock(&sb->table_lock);
+}
+
+static void flush_to_global(HashTable* local_ht, GlobalMapData* gmd) {
+		fprintf(stderr, "flushing local to global: %lu /  %lu\n", local_ht->size, local_ht->capacity);
+		// flush to main table
+		double map_flush_start, map_flush_end;
 		
-		// Get file size
-		if (fseek(f, 0, SEEK_END) == -1) { fprintf(stderr, "Failed to seek to end\n"); return 1; }
-		const size_t filesize = ftell(f);
-		if (filesize == (size_t) -1) { fprintf(stderr, "Failed to fseek\n"); return 1; }
-		if (fseek(f, 0, SEEK_SET) == -1) { fprintf(stderr, "Failed to seek back to beginning\n"); return 1; }
+		map_flush_start = omp_get_wtime();
+		
+		HashTable* g_ht = gmd->g_ht;
 
-		// Calculate offsets on word boundaries
-		calculate_start_offsets(f, filesize, file_offsets, n_readmap_threads);
+		for (size_t i = 0, count = 0; i < local_ht->capacity && count < local_ht->size; i++) {
+			HashEntry* entry = local_ht->entries + i;
+			if (!entry->count) continue;
+
+			if (g_ht->size > (size_t) (g_ht->capacity * FLUSH_THRESHOLD)) {
+				try_flush_global(gmd);
+			}
+
+			ht_locked_insert(gmd->g_ht, entry->hash, sp_get(local_ht->sp, entry->sp_offset), entry->len, entry->count);
+
+			count += 1;
+		}
+
+		ht_clear(local_ht);
+
+		map_flush_end = omp_get_wtime();
+
+		fprintf(stderr, "It took %lf to flush local to global\n", map_flush_end - map_flush_start);
+}
+
+static void map_thread(GlobalMapData* gmd, LocalMapData* lmd) {
+	HashTable local_ht;
+	if (ht_init(&local_ht, gmd->t_ht_capacity, gmd->t_sp_capacity, 0)) {
+		fprintf(stderr, "Thread: %u failed to allocate hashtable\n", omp_get_thread_num());
+		return; 
+	}
+	
+	pthread_mutex_lock(&gmd->mutex);
+	while(1) {
+		pthread_cond_wait(&gmd->cond, &gmd->mutex);
+		int rank;
+		MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+		// fprintf(stderr, "rank %d map thread %u got signaled: %d\n", rank, omp_get_thread_num(), gmd->command);
+		pthread_mutex_unlock(&gmd->mutex);
+
+		#pragma omp atomic
+		gmd->working += 1;
+
+		if (gmd->command == DIE) {
+			fprintf(stderr, "rank: %d map flushing before death\n", rank);
+
+			flush_to_global(&local_ht, gmd);
+
+			#pragma omp atomic
+			gmd->done += 1;
+
+			fprintf(stderr, "mapper %u exited\n", omp_get_thread_num());
+			break;
+		}
+		fprintf(stderr, "processing file: %s\n", gmd->file_name);
+		
+		size_t count = 0;
+		size_t start = lmd->start;
+		size_t end = lmd->end; // this will be calculated by the coordinator thread now
+		FILE* f = fopen(gmd->file_name, "rb");
+		if (!f) { fprintf(stderr, "Failed to open file %s on iteration %u\n", gmd->file_name, omp_get_thread_num()); continue; }
+		fseek(f, start, SEEK_SET);
+
+		size_t len = 0;
+		char buf[READBUFSIZE];
+		int c = fgetc(f);
+		
+		//
+		// PARSING/READING/MAPPING LOOP
+		//
+		double read_start, read_end;
+		read_start = omp_get_wtime();
+
+		for (size_t offset = start; offset < end && c != EOF; offset++, c = fgetc(f)) {
+			if (!is_alphanum(c)) {
+				if (len > 0) {
+						count += 1;
+						ht_insert(&local_ht, fnv_hash(buf, len), buf, len, 1);
+						len = 0;
+						if ((double) local_ht.size > (double) local_ht.capacity * FLUSH_THRESHOLD ||
+								(double) local_ht.sp->used > (double) local_ht.sp->capacity * FLUSH_THRESHOLD)
+							flush_to_global(&local_ht, gmd);
+					}
+			}
+			else if (len == READBUFSIZE)
+				{
+					count += 1;
+					ht_insert(&local_ht, fnv_hash(buf, len), buf, len, 1);
+					len = 0;
+					if ((double) local_ht.size > (double) local_ht.capacity * FLUSH_THRESHOLD ||
+							(double) local_ht.sp->used > (double) local_ht.sp->capacity * FLUSH_THRESHOLD)
+						flush_to_global(&local_ht, gmd);
+				}
+			else
+				buf[len++] = c;
+		}
+
+		read_end = omp_get_wtime();
+		fprintf(stderr, "Thread %u took %lf seconds to read %lu words to local table\n", omp_get_thread_num(), read_end - read_start, count);
 
 		fclose(f);
+			if ((double) local_ht.size > (double) local_ht.capacity * FLUSH_THRESHOLD ||
+					(double) local_ht.sp->used > (double) local_ht.sp->capacity * FLUSH_THRESHOLD)
+				flush_to_global(&local_ht, gmd);
 
-		//
-		// PHASE 2.1
-		//
-		
-		double readmap_start, readmap_end;
+		// do work
+		#pragma omp atomic
+		gmd->done += 1;
 
-		readmap_start = MPI_Wtime();
-		#pragma omp parallel for
-		for (size_t j = 0; j < n_readmap_threads; j++) {
-			HashTable* map = maps[j];
-			size_t start = file_offsets[j];
-			size_t end = (j == n_readmap_threads - 1) ? filesize : file_offsets[j + 1];
+		// fprintf(stderr, "thread %u printing hashtable:\n", omp_get_thread_num());
+		// ht_print(&local_ht);
 
-			FILE* f = fopen(file_name, "r");
-			if (!f) { fprintf(stderr, "Failed to open file %s on iteration %lu\n", file_name, j); continue; }
-			fseek(f, start, SEEK_SET);
-
-			size_t len = 0;
-			char buf[READBUFSIZE];
-			enum ReadState state = PROCESS;
-			int c = fgetc(f);
-			
-			//
-			// PARSING/READING/MAPPING LOOP
-			//
-			for (size_t offset = start; offset < end && c != EOF; offset++, c = fgetc(f)) {
-				switch (state) {
-					case PROCESS:
-						if (!is_alphanum(c) || len == READBUFSIZE) {	// INSERT WORD
-							ht_insert(map, fnv_hash(buf, len), buf, len);
-							len = 0;
-							fseek(f, -1, SEEK_CUR);
-							offset -= 1;
-							state = CONSUME;
-						} else {
-							buf[len++] = c;
-						}
-						break;
-					case CONSUME:
-						if (is_alphanum(c)) {
-							fseek(f, -1, SEEK_CUR);
-							offset -= 1;
-							state = PROCESS;
-						}
-						break;
-				}
-			}
-
-			fclose(f);
-			
-			//
-			// AGGREGATE Thread-Local Maps to Global Map
-			//
-			/*	
-			double aggregate_start, aggregate_end;
-
-			aggregate_start = MPI_Wtime();
-			
-			for (size_t entries = 0; entries < maps[i]->capacity; entries++) {
-				//fprintf(stderr, "%lu\n", i);
-				HashEntry* entry = maps[i]->entries + entries;
-				if (!entry->count) continue;
-				
-				char* old_sp_offset = sp_get(maps[i]->sp, entry->sp_offset);
-				ht_locked_insert(g_map_ht, entry->hash, old_sp_offset, entry->len);
-			}
-
-			aggregate_end = MPI_Wtime();
-
-			fprintf(stderr, "Aggregate took thread %lu, %lf seconds.\n", i, aggregate_end - aggregate_start);
-			*/
-		}
-		readmap_end = MPI_Wtime();
-
-		fprintf(stderr, "ReadMap took %lf seconds.\n", readmap_end - readmap_start);
-
-		// DEBUG STATS
-		fprintf(stderr, "HashTables\n");
-		for (size_t i = 0; i < n_readmap_threads; i++) {
-			ht_print(maps[i]);
-		}
-
-		fprintf(stderr, "GLOBAL HashTable:\n");
-		ht_print(g_map_ht);
-
-		// String Pools seem to be fine since they can grow in memory
-		fprintf(stderr, "StringPools:\n");
-		for (size_t i = 0; i < n_readmap_threads; i++) {
-			sp_print(maps[i]->sp);
-		}
-
-		fprintf(stderr, "GLOBAL StringPool: (Doens't Have Locking RN)\n");
-		sp_print(g_map_ht->sp);
-
-		ht_clear(maps[i]);
+		// clear local table
+		// ht_clear(&local_ht);
 	}
-	//
-	// CLEAN
-	//
-	
-	for (size_t i = 0; i < n_readmap_threads; i++) {
-		ht_free(maps[i]);
-	}
-	free(maps);
-	free(file_offsets); 
-	return 0;
 }
+
+static void send_thread(GlobalMapData* gmd, HashTable* reducer_table) {
+	SendBuf* sb = gmd->sb;
+
+	pthread_mutex_lock(&sb->mutex);
+	while (1) {
+		#pragma omp atomic write
+		sb->working = 0;
+
+		pthread_cond_wait(&sb->cond, &sb->mutex);
+		pthread_mutex_unlock(&sb->mutex);
+
+		fprintf(stderr, "send thread got signaled, command: %d\n", sb->command);
+		
+		// flush sends before death
+		if (sb->command == DIE) {
+			for (size_t i = 0; i < sb->n_dests; i++) {
+				size_t size = sb->buf_sizes[i];
+				fprintf(stderr, "rank %d sending to proc %ld: %lu entries\n", rank, i, size);
+				if (!size || i == (size_t) rank) continue;
+
+				fprintf(stderr, "MPI SEND CALL: buf: %p, bytes: %lu (%lu entries), to: %lu\n", sb->process_buffers[i], sizeof(SendEntry) * size, size, i);
+				MPI_Send(sb->process_buffers[i], sizeof(SendEntry) * size, MPI_BYTE, i, 3, MPI_COMM_WORLD); 
+			}
+
+			#pragma omp atomic
+				sb->signal += 1;
+
+			#pragma omp atomic write
+				sb->working = 0;
+			
+			fprintf(stderr, "send_thread exiting\n");
+			break;
+		} else { 
+			#pragma omp atomic
+			sb->signal += 1;
+		}
+
+		// swap
+		
+		HashTable* tmp = gmd->g_ht;
+		#pragma omp atomic write
+			gmd->g_ht = sb->table;	
+		sb->table = tmp;
+
+		// flush
+		omp_set_lock(&sb->table_lock);
+		HashTable* table = sb->table;
+		
+		while (table->n_reference > 0) {	
+			nanosleep(&(struct timespec) { 0, 100000 }, NULL);
+		}
+		
+		// attempting to send
+		fprintf(stderr, "attempting to flush: %lu entries out of table %p\n", table->size, (void*)table);
+		for (size_t i = 0, count = 0; i < table->capacity && count < table->size; i++) {
+			HashEntry* entry = table->entries + i;
+			if (!entry->count) continue;
+			
+			size_t proc = entry->hash % sb->n_dests;
+			// fprintf(stderr, "hash: %lx, str: %.*s, dest proc: %lu\n", entry->hash, (int)entry->len, sp_get(table->sp, entry->sp_offset), proc);
+			if (proc == (size_t) rank) {
+				ht_locked_insert(reducer_table, entry->hash, sp_get(table->sp, entry->sp_offset), entry->len, entry->count);
+				continue;
+			}
+			SendEntry* buf = sb->process_buffers[proc];
+
+			if (sb->buf_sizes[proc] == sb->buf_capacities) {
+				fprintf(stderr, "ATTEMPTING SEND from buffer: %p, bytes: %lu (%lu entries), to proc: %lu\n", buf, sb->buf_capacities * sizeof(SendEntry), sb->buf_capacities, proc);
+				MPI_Send(buf, sizeof(SendEntry) * sb->buf_capacities, MPI_BYTE, proc, 3, MPI_COMM_WORLD); 
+				sb->buf_sizes[proc] = 0;
+			}
+			buf += sb->buf_sizes[proc];
+
+			// insertion
+			buf->count = entry->count;
+			buf->hash = entry->hash;
+			buf->len = entry->len;
+
+			if (buf->len >= SENDWORD_CAPACITY) {
+				fprintf(stderr, "INTERETING CATCH hash entry with len: %lu\n", buf->len);
+			}
+
+			strncpy(buf->str, sp_get(sb->table->sp, entry->sp_offset), entry->len);
+
+			sb->buf_sizes[proc] += 1;
+
+			count += 1;
+		}
+
+		ht_clear(table);
+		omp_unset_lock(&sb->table_lock);
+
+		fprintf(stderr, "send buf resetting\n");
+	}
+
+	fprintf(stderr, "send buf exiting\n");
+}
+
+static void recieve_thread(HashTable* reducer_table, RecvBuf* rb, RecvData* rd) {
+	int flag;
+	int size;
+	MPI_Status s;
+	MPI_Message m;
+
+	while (1) {
+		// Probe for message
+		MPI_Improbe(MPI_ANY_SOURCE, 3, MPI_COMM_WORLD, &flag, &m, &s);
+
+		if (flag) {
+			MPI_Get_count(&s, MPI_BYTE, &size);
+			if ((size_t) size > SENDBUF_CAPACITY * sizeof(SendEntry)) {
+				fprintf(stderr, "WARNING: incoming message is larger than expected!\n"); 
+			} 
+		
+			fprintf(stderr, "RECIEVING\n");
+			MPI_Mrecv(rb->buffer, size, MPI_BYTE, &m, MPI_STATUS_IGNORE);
+			fprintf(stderr, "recieved %d bytes (%ld entries) from process %d\n", size, size / sizeof(SendEntry), s.MPI_SOURCE);
+	
+			for (size_t i = 0; i < size / sizeof(SendEntry); i++) {
+				SendEntry* entry = rb->buffer + i;
+				ht_locked_insert(reducer_table, entry->hash, entry->str, entry->len, entry->count);
+			} 
+		} else if (rd->command == DIE) {
+			fprintf(stderr, "recieve %u thread exiting\n", omp_get_thread_num());
+			break;
+		} else {
+			nanosleep(&(struct timespec) { 0, 100000 }, NULL);
+		}
+	}
+}
+
+static void rank0_coordinator_loop(int n_files, char** file_names, GlobalMapData* gmd, LocalMapData* lmd) {
+	size_t* file_offsets = malloc(sizeof(size_t) * gmd->n_mapper);
+	
+	size_t other_active_procs = world_size - 1;
+
+	// for now:
+	for (int i = world_size - 1; i < n_files; i++) {
+		char* file_name = file_names[i];
+		fprintf(stderr, "Attempting file: %s\n", file_name);
+
+		FILE* f = fopen(file_name, "rb");
+		if (!f) { fprintf(stderr, "Failed to open file %s\n", file_name); continue; }
+		
+		// Get file size
+		if (fseek(f, 0, SEEK_END) == -1) { fprintf(stderr, "Failed to seek to end\n"); return; }
+		const size_t filesize = ftell(f);
+		if (filesize == (size_t) -1) { fprintf(stderr, "Failed to fseek\n"); return; }
+		if (fseek(f, 0, SEEK_SET) == -1) { fprintf(stderr, "Failed to seek back to beginning\n"); return; }
+
+		// Calculate offsets on word boundaries
+		calculate_start_offsets(f, filesize, file_offsets, gmd->n_mapper);
+		fclose(f);
+		
+		lmd[0].start = 0;
+		for (size_t i = 1; i < gmd->n_mapper; i++) {
+			lmd[i - 1].end = file_offsets[i];
+			lmd[i].start = file_offsets[i];
+		}
+		lmd[gmd->n_mapper - 1].end = filesize;
+		
+		// set final global data
+		gmd->file_name = file_name;
+
+		// broadcast
+		while(gmd->working != gmd->n_mapper) {
+			pthread_cond_broadcast(&gmd->cond);
+			nanosleep(&(struct timespec) { 0, 100000 }, NULL);
+		}
+		
+		// check incoming file requests here but just rest for now
+		while (gmd->done != gmd->n_mapper) {
+			int flag;
+			MPI_Message m;
+			MPI_Status s;
+			MPI_Improbe(MPI_ANY_SOURCE, 1, MPI_COMM_WORLD, &flag, &m, &s);
+
+			if (flag) {
+				fprintf(stderr, "rank 0 recieved a file request from rank %u\n", s.MPI_SOURCE);
+	
+				MPI_Mrecv(NULL, 0, MPI_CHAR, &m, MPI_STATUS_IGNORE);
+
+				int data = -1;
+				if ((size_t)i + 1 < gmd->n_mapper) {
+					data = ++i;
+					
+					fprintf(stderr, "sending back index: %u\n", i);
+				} else { other_active_procs -= 1; }
+				
+				MPI_Send(&data, 1, MPI_INT, s.MPI_SOURCE, 1, MPI_COMM_WORLD);
+				
+			} else { nanosleep(&(struct timespec) { 0, 100000 }, NULL); }
+		}
+
+		// reset counter states
+		gmd->working = 0;
+		gmd->done = 0;
+
+		fprintf(stderr, "Global State:\n");
+		ht_print(gmd->g_ht);
+
+		fprintf(stderr, "mapper threads finished\n");
+	}
+
+	// wait for other processes to finish mapping so I can stop coordinating
+	MPI_Status s;
+	const int data = -1;
+	for (size_t i = 0; i < other_active_procs; i++) { 
+		MPI_Recv(NULL, 0, MPI_CHAR, MPI_ANY_SOURCE, 1, MPI_COMM_WORLD, &s);
+		MPI_Send(&data, 1, MPI_INT, s.MPI_SOURCE, 1, MPI_COMM_WORLD);
+	}
+}
+
+static void rankother_coordinator_loop(int n_files, char** file_names, GlobalMapData* gmd, LocalMapData* lmd) { 
+	size_t* file_offsets = malloc(sizeof(size_t) * gmd->n_mapper);
+	int file_index = rank - 1;
+
+	do {
+		fprintf(stderr, "rank %u is doing file_index %u\n", rank, file_index); 
+
+		char* file_name = file_names[file_index];
+		fprintf(stderr, "Attempting file: %s\n", file_name);
+
+		FILE* f = fopen(file_name, "rb");
+		if (!f) {
+			fprintf(stderr, "Failed to open file %s\n", file_name);
+			goto rankother_coordinator_loop_request;
+		}
+		
+		// Get file size
+		if (fseek(f, 0, SEEK_END) == -1) { fprintf(stderr, "Failed to seek to end\n"); return; }
+		const size_t filesize = ftell(f);
+		if (filesize == (size_t) -1) { fprintf(stderr, "Failed to fseek\n"); return; }
+		if (fseek(f, 0, SEEK_SET) == -1) { fprintf(stderr, "Failed to seek back to beginning\n"); return; }
+
+		// Calculate offsets on word boundaries
+		calculate_start_offsets(f, filesize, file_offsets, gmd->n_mapper);
+		fclose(f);
+		
+		lmd[0].start = 0;
+		for (size_t i = 1; i < gmd->n_mapper; i++) {
+			lmd[i - 1].end = file_offsets[i];
+			lmd[i].start = file_offsets[i];
+		}
+		lmd[gmd->n_mapper - 1].end = filesize;
+		
+		// set final global data
+		gmd->file_name = file_name;
+
+		// broadcast
+		while(gmd->working != gmd->n_mapper) {
+			pthread_cond_broadcast(&gmd->cond);
+			nanosleep(&(struct timespec) { 0, 100000 }, NULL);
+		}
+		
+		// check incoming file requests here but just rest for now
+		while (gmd->done != gmd->n_mapper) {
+			nanosleep(&(struct timespec) { 0, 100000 }, NULL);
+		}
+
+		// reset counter states
+		gmd->working = 0;
+		gmd->done = 0;
+
+		fprintf(stderr, "Global State:\n");
+		ht_print(gmd->g_ht);
+
+		fprintf(stderr, "mapper threads finished\n");
+
+rankother_coordinator_loop_request:
+	
+		// REQUEST FOR FILE
+		fprintf(stderr, "rank %d requesting new file index\n", rank);
+		MPI_Send(NULL, 0, MPI_CHAR, 0, 1, MPI_COMM_WORLD);
+
+		fprintf(stderr, "rank %u mpirecv call\n", rank);
+		MPI_Recv(&file_index, 1, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+		
+		fprintf(stderr, "rank %u recieved index %d\n", rank, file_index);
+
+		if (file_index == -1) break;
+		if (file_index >= n_files) {
+			fprintf(stderr, "recieved a bad file index: %d??\n", file_index);
+			break;
+		}
+	} while (1);
+
+}
+
+static void coordinator_thread(int n_files, char** file_names, GlobalMapData* gmd, LocalMapData* lmd) {
+	SendBuf* sb = gmd->sb;
+	
+	if (!rank)
+		rank0_coordinator_loop(n_files, file_names, gmd, lmd);
+	else
+		rankother_coordinator_loop(n_files, file_names, gmd, lmd); 
+
+	// signal mappers to flush and die
+	gmd->done = 0;
+	gmd->command = DIE;
+	while (gmd->done < gmd->n_mapper) {
+		pthread_cond_broadcast(&gmd->cond);
+		nanosleep(&(struct timespec) { 0, 100000 }, NULL);
+	}
+
+	// flush the global table
+	if (gmd->g_ht->size > 0) {
+		flush_global(gmd);
+	}
+
+	// Kill the send thread after its done
+	sb->command = DIE;
+	sb->working = 1;
+	sb->signal = 0;
+	while (sb->working != 0 || sb->signal < 1) {	
+		pthread_cond_broadcast(&sb->cond);
+		nanosleep(&(struct timespec) { 0, 100000 }, NULL);
+	}
+	
+	MPI_Barrier(MPI_COMM_WORLD);
+			
+	// soft request the recieving threads
+	for (size_t i = 0; i < gmd->n_reducer; i++) {
+		gmd->recv_data[i].command = DIE;
+	}
+
+	fprintf(stderr, "exiting coordinator\n");
+} 
 
 int main(int argc, char** argv) {
 	if (argc < 2) {
 		fprintf(stderr, "Usage: wc [FILE1] [FILE2] [FILE{n}...]\n");
 		return 0;
 	}
+
+	if (omp_get_max_threads() < 3) {
+		fprintf(stderr, "atleast 3 threads required\n");
+		return 1;
+	}
+
+	// MPI init
+	int provided = 100;
+	MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE, &provided);
+	if (provided < MPI_THREAD_MULTIPLE) {
+		fprintf(stderr, "Couldn't get required MPI_THREAD level\n");
+		return 1;
+	}
+
+	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+	MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+
+	// shrink the effective world size if we don't need other processes
+	if (argc - 1 < world_size) {
+		world_size = argc - 1;
+		if (rank >= world_size) {
+			fprintf(stderr, "Process %u not necessary, not participating\n", rank);
+			MPI_Barrier(MPI_COMM_WORLD); 
+			MPI_Finalize();
+			return 0;
+		}
+	}
+
+	const size_t available = omp_get_max_threads() - 2;		// coordination thread and send thread are taken
+	const size_t n_mapper = available / 2;
+	const size_t n_reducer = available - n_mapper;
+
+	LocalMapData* lmd = malloc(sizeof(LocalMapData) * n_mapper);
+	if (!lmd) { fprintf(stderr, "Failed to allcoate MapData array\n"); return 1; }
+
+	// global mapping table
+	HashTable g_ht;
+	if (ht_init(&g_ht, HT_CAPACITY, SP_CAPACITY, 1)) { free(lmd); fprintf(stderr, "Failed to allcoate reduce table\n"); return 1; }	
+
+	// Initialize Send buffer
+	SendBuf sb;
+	sb.signal = 0;
+	sb.working = 0;
+	sb.table = ht_new(HT_CAPACITY, SP_CAPACITY, 1);
+	if (!sb.table) { fprintf(stderr, "Failed to allocate g_ht swap table\n"); }
 	
+	pthread_mutex_init(&sb.mutex, NULL);
+	pthread_cond_init(&sb.cond, NULL);
+
+	sb.n_dests = world_size;		// build in the current rank to keep the indexing
+	sb.buf_capacities = SENDBUF_CAPACITY;
+
+	omp_init_lock(&sb.table_lock);
+	
+	sb.buf_sizes = calloc(sb.n_dests, sizeof(size_t));
+	if (!sb.buf_sizes) { fprintf(stderr, "Failed to allocate sb.buf_sizes"); return 1;
+	}
+
+	sb.process_buffers = malloc(sizeof(void*) * sb.n_dests);
+	if (!sb.process_buffers) { fprintf(stderr, "Failed to allocate sb.process_buffers\n"); return 1;}
+	
+	for (size_t i = 0; i < sb.n_dests; i++) {
+		if (i == (size_t) rank) {
+			sb.process_buffers[i] = NULL;
+			continue;
+		}
+
+		sb.process_buffers[i] = malloc(sizeof(SendEntry) * sb.buf_capacities);
+		if (!sb.process_buffers[i]) { fprintf(stderr, "Failed to allocate process buffer %lu for the process buffers\n", i); return 1; }
+	}
+
+	RecvBuf* recv_buffers = malloc(sizeof(RecvBuf) * n_reducer);
+	if (!recv_buffers) { fprintf(stderr, "Failed to allocate recv_buffers array\n"); return 1; }
+
+	// for n in number of reducers, allocate buffers
+	for (size_t i = 0; i < n_reducer; i++) {
+		RecvBuf* buf = recv_buffers + i;
+		buf->buffer = malloc(sizeof(SendEntry) * SENDBUF_CAPACITY);
+		if (!buf->buffer) { fprintf(stderr, "Failed to allocate the underlying buffer for recvbuf object for reducer: %lu\n", i); return 1;}
+		buf->size = 0;
+		buf->capacity = SENDBUF_CAPACITY;
+	}
+
+	RecvData* recv_data = malloc(sizeof(RecvData) * n_reducer);
+	for (size_t i = 0; i < n_reducer; i++) { 
+		recv_data[i].command = WORK;
+	}
+
+	HashTable reducer_table;
+	if (ht_init(&reducer_table, RD_HT_CAPACITY / world_size, RD_SP_CAPACITY / world_size, 1)) {
+		fprintf(stderr, "Failed to allocate reducer table\n");
+		return 1;
+	}
+
+	// global mapping data
+	GlobalMapData gmd = {
+		.file_name = NULL,
+		.command = WORK,
+		.t_ht_capacity = HT_CAPACITY / n_mapper,
+		.t_sp_capacity = SP_CAPACITY / n_mapper,
+		.n_mapper = n_mapper,
+		.n_reducer = n_reducer,
+		.mutex = PTHREAD_MUTEX_INITIALIZER,
+		.cond = PTHREAD_COND_INITIALIZER,
+		.done = 0,
+		.g_ht = &g_ht,
+		.sb = &sb, 
+		.recv_data = recv_data,
+	};
+
+	
+	// Spawn threads
+
 	double start, stop;
-	start = MPI_Wtime();
+	start = omp_get_wtime();
 
-	map_reduce(argc - 1, argv + 1);
+	#pragma omp parallel
+	{
+		#pragma omp single
+		{
+			#pragma omp task
+			send_thread(&gmd, &reducer_table);
 
-	stop = MPI_Wtime();
+			for (size_t i = 0; i < n_mapper; i++) {
+				#pragma omp task
+				map_thread(&gmd, lmd);
+			}
+			for (size_t i = 0; i < n_reducer; i++) {
+				#pragma omp task
+				recieve_thread(&reducer_table, recv_buffers + i, recv_data + i);
+			}
+			
+			coordinator_thread(argc - 1, argv + 1, &gmd, lmd);
 
-	fprintf(stderr, "Total Time: %lf\n", stop - start);
+			#pragma omp taskwait
+			
+			fprintf(stderr, "Rank %u, Global Table Final: \n", rank);
+			ht_print(gmd.g_ht);
+
+			fprintf(stderr, "Rank %u, SendBuf Table Final: \n", rank);
+			ht_print(sb.table);
+
+			fprintf(stderr, "Rank %u, Reducer Table Final: \n", rank);
+			ht_print(&reducer_table);
+		}
+	}
+
+	stop = omp_get_wtime();
+	if (!rank)
+		fprintf(stderr, "Total Time: %lf\n", stop - start);
+
+	fprintf(stderr, "rank: %u, CALLING MPI_FINALIZE\n", rank);
+
+	MPI_Finalize();
+
+	fprintf(stderr, "rank %u out\n", rank);
+
+	for (size_t i = 0, count = 0; i < reducer_table.capacity && count < reducer_table.size; i++) {
+		HashEntry* entry = reducer_table.entries + i;
+		if (!entry->count) continue;
+
+		printf("%5s (%lx): %lu\n", sp_get(reducer_table.sp, entry->sp_offset), entry->hash, entry->count);
+	}
 }
 
