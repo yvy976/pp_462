@@ -18,6 +18,7 @@ struct HashTable {
 	HashEntry* entries;
 	StringPool* sp;
 	omp_lock_t* locks;
+	size_t n_reference;
 	size_t n_locks;
 	size_t stripe_size;
 
@@ -29,6 +30,7 @@ struct HashTable {
 };
 
 void ht_free(HashTable* ht);
+int ht_init(HashTable* ht, size_t ht_capacity, size_t sp_capacity, size_t stripe_size);
 HashTable* ht_new(size_t ht_capacity, size_t sp_capacity, size_t stripe_size);
 
 // Takes the hash and string.
@@ -41,8 +43,8 @@ HashTable* ht_new(size_t ht_capacity, size_t sp_capacity, size_t stripe_size);
 //
 // The hash is used to do true comparisons of the entries as well as
 // partially used to index the table.
-int ht_insert(HashTable* ht, uint64_t hash, const char* str, size_t len);
-int ht_locked_insert(HashTable* ht, uint64_t hash, const char* str, size_t len);
+int ht_insert(HashTable* ht, uint64_t hash, const char* str, size_t len, size_t count);
+int ht_locked_insert(HashTable* ht, uint64_t hash, const char* str, size_t len, size_t count);
 
 void ht_clear(HashTable* ht);
 

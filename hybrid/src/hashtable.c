@@ -40,29 +40,28 @@ void ht_free(HashTable* ht) {
 	free(ht);
 }
 
-// if stripe size is 0, it isn't concurrent and shouldn't be called with locked functions
-HashTable* ht_new(size_t ht_capacity, size_t sp_capacity, size_t stripe_size) {
-	HashTable* ht = malloc(sizeof(*ht));
-	if (!ht) return NULL;
+int ht_init(HashTable* ht, size_t ht_capacity, size_t sp_capacity, size_t stripe_size) {
+	if (!ht) return 1;
 
 	ht->entries = calloc(ht_capacity, sizeof(*ht->entries));
-	if (!ht->entries) { free(ht); return NULL; }
+	if (!ht->entries) { return 1; }
 
-	ht->sp = sp_new(sp_capacity);
-	if (!ht->sp) { free(ht->entries); free(ht); return NULL; }
+	ht->sp = sp_new(sp_capacity, stripe_size);
+	if (!ht->sp) { free(ht->entries); return 1; }
 
 	if (stripe_size) {
 		ht->n_locks = ht_capacity / stripe_size;
 		if (ht_capacity % stripe_size) ht->n_locks += 1;
 
 		ht->locks = malloc(sizeof(*ht->locks) * ht->n_locks);
-		if (!ht->locks) { sp_free(ht->sp); free(ht->entries); free(ht); return NULL; }
+		if (!ht->locks) { sp_free(ht->sp); free(ht->entries); return 1; }
 		
 		for (size_t i = 0; i < ht->n_locks; i++) {
 			omp_init_lock(ht->locks + i);
 		}
 
 		ht->stripe_size = stripe_size;
+		ht->n_reference = 0;
 	}
 	else { ht->locks = NULL; ht->stripe_size = 0; ht->n_locks = 0; }
 
@@ -71,99 +70,110 @@ HashTable* ht_new(size_t ht_capacity, size_t sp_capacity, size_t stripe_size) {
 	ht->total = 0;
 	ht->true_coll = 0;
 
+	return 0;
+}
+
+// if stripe size is 0, it isn't concurrent and shouldn't be called with locked functions
+HashTable* ht_new(size_t ht_capacity, size_t sp_capacity, size_t stripe_size) {
+	HashTable* ht = malloc(sizeof(HashTable));
+	if (!ht || ht_init(ht, ht_capacity, sp_capacity, stripe_size)) { free(ht); return NULL; }
+
 	return ht;
 }
 
-int ht_insert(HashTable* ht, uint64_t hash, const char* str, size_t len) {
+int ht_insert(HashTable* ht, uint64_t hash, const char* str, size_t len, size_t count) {
 	if (ht->size >= ht->capacity) { fprintf(stderr, "hash table full\n"); return 1; }
 	
 	for (size_t i = hash % ht->capacity, j = 0; j < ht->capacity; i = (i + 1) % ht->capacity, j++) { 
-		HashEntry* entry = ht->entries + i;
+		HashEntry* e = ht->entries + i;
 
-		// if found, increment
-		if (entry->count) {
-			if (entry->hash == hash)
-					{
-					const char* str = sp_get(ht->sp, entry->sp_offset);
-					if (strncmp(str, str, len)) {
-						// fprintf(stderr, "WARNING: TRUE 64-bit HASH COLLISION with strings: ENTRY |%s| and NEW |%s|\n", entry_str, str);
-						ht->true_coll += 1;
-					}
-					entry->count += 1;
-					ht->total += 1;
-					return 0;
-				}
-			else
-				continue;
+		if (!e->count) {
+			e->count = count;
+			e->sp_offset = sp_add(ht->sp, str, len);
+			e->hash = hash;
+			e->len = len;
+
+			ht->size += 1;
+			ht->total += count;
+
+			return 0;
 		}
+		else if (e->hash != hash) { continue; }
+		else if (strcmp(str, sp_get(ht->sp, e->sp_offset))) {
+			ht->true_coll += 1;
+			continue;
+		}
+		else {
+			e->count += count;
+			ht->total += count;
 
-		// empty entry found, insert here
-		entry->hash = hash;
-		entry->sp_offset = sp_add(ht->sp, str, len);
-		entry->len = len;
-		entry->count = 1;
-		ht->size += 1;
-		ht->total += 1;
-		return 0;
+			return 0;
+		}
 	}
 
 	fprintf(stderr, "WARNING Reach end of hash_table in ht_insert without inserting\n");
 	return 1;
 }
 
-int ht_locked_insert(HashTable* ht, uint64_t hash, const char* str, size_t len) {
-	if (ht->size >= ht->capacity) { fprintf(stderr, "hash table full\n"); return 1; }
+int ht_locked_insert(HashTable* ht, uint64_t hash, const char* str, size_t len, size_t count) {
+	#pragma omp atomic
+	ht->n_reference += 1;
+
+	size_t cap = ht->capacity;
 	
-	size_t start_i = hash % ht->capacity;
-	size_t prev_stripe_id = start_i % ht->n_locks;
+	for (size_t i = hash % cap, j = 0; j < cap; i = (i + 1) % cap, j++) {
+		HashEntry* e = ht->entries + i;
 
-	omp_set_lock(ht->locks + prev_stripe_id);
-	for (size_t i = start_i, j = 0; j < ht->capacity; i = (i + 1) % ht->capacity, j++) { 
-		HashEntry* entry = ht->entries + i;
-		size_t stripe_id = i % ht->n_locks;
-		
-		// lock the next region before any operations
-		if (prev_stripe_id != stripe_id) {
-			omp_unset_lock(ht->locks + prev_stripe_id);
-			omp_set_lock(ht->locks + stripe_id);
-			prev_stripe_id = stripe_id;
+		size_t stripe_id = i / ht->stripe_size;
+	
+		omp_set_lock(&ht->locks[stripe_id]);
+		if (!e->count) {
+			e->count = count;
+			e->sp_offset = sp_add(ht->sp, str, len);
+			e->hash = hash;
+			e->len = len;
+			
+			omp_unset_lock(&ht->locks[stripe_id]);
+			
+			#pragma omp atomic
+			ht->size += 1;
+
+			#pragma omp atomic
+			ht->total += count;
+			
+			#pragma omp atomic
+			ht->n_reference -= 1;
+			return 0;
 		}
-
-		// if found, increment
-		if (entry->count) {
-			if (entry->hash == hash)
-				{
-					const char* entry_str = sp_get(ht->sp, entry->sp_offset);
-					if (strcmp(str, entry_str)) {
-						// fprintf(stderr, "WARNING: TRUE 64-bit HASH COLLISION with strings: ENTRY |%s| and NEW |%s|\n", entry_str, str);
-						ht->true_coll += 1;
-					}
-					entry->count += 1;
-					ht->total += 1;
-					goto ht_locked_insert_success;
-				}
-			else
-				continue;
+		else if (e->hash != hash) { omp_unset_lock(&ht->locks[stripe_id]); continue; }
+		else if (strcmp(str, sp_get(ht->sp, e->sp_offset))) {
+			#pragma omp atomic
+				ht->true_coll += 1;
+			omp_unset_lock(&ht->locks[stripe_id]);
+			continue;
 		}
+		else {
+			omp_unset_lock(&ht->locks[stripe_id]);
+			#pragma omp atomic
+			e->count += count;
 
-		// empty entry found, insert here
-		entry->hash = hash;
-		entry->sp_offset = sp_add(ht->sp, str, len);
-		entry->len = len;
-		entry->count = 1;
-		ht->size += 1;
-		ht->total += 1;
-		goto ht_locked_insert_success;
+			#pragma omp atomic
+			ht->total += count;
+
+			#pragma omp atomic
+			ht->n_reference -= 1;
+			return 0;
+		}
 	}
 
-	omp_unset_lock(ht->locks + prev_stripe_id);
-	fprintf(stderr, "WARNING Reach end of hash_table in ht_insert without inserting\n");
-	return 1;
+	fprintf(stderr, "couldn't find place in table, table full\n");
 
-ht_locked_insert_success:
-	omp_unset_lock(ht->locks + prev_stripe_id);
-	return 0;
+	#pragma omp atomic
+	ht->n_reference += 1;
+
+	return 1;
 }
+
 
 void ht_clear(HashTable* ht) {
 	sp_clear(ht->sp);
@@ -177,7 +187,6 @@ void ht_clear(HashTable* ht) {
 	ht->total = 0;
 	ht->true_coll = 0;
 }
-
 
 void ht_print(HashTable* ht) {
 	fprintf(stderr, "\t# of Entries: %lu/%lu (%lf%%)\n\tTotal Word Count: %lu\n\tTrue Collisions: %lu\n", ht->size, ht->capacity, (double) ht->size * 100 / ht->capacity, ht->total, ht->true_coll);
