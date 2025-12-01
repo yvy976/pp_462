@@ -63,11 +63,13 @@ int ht_init(HashTable* ht, size_t ht_capacity, size_t sp_capacity, size_t stripe
 			omp_init_lock(ht->locks + i);
 		}
 
+		omp_init_lock(&ht->lock);
+
 		ht->stripe_size = stripe_size;
 		ht->n_reference = 0;
 	}
 	else { ht->locks = NULL; ht->stripe_size = 0; ht->n_locks = 0; }
-
+	
 	ht->capacity = ht_capacity;
 	ht->size = 0;
 	ht->total = 0;
@@ -123,20 +125,23 @@ int ht_locked_insert(HashTable* ht, uint64_t hash, const char* str, size_t len, 
 	ht->n_reference += 1;
 
 	size_t cap = ht->capacity;
-	
+
+	omp_set_lock(&ht->lock);
+
 	for (size_t i = hash % cap, j = 0; j < cap; i = (i + 1) % cap, j++) {
 		HashEntry* e = ht->entries + i;
 
 		size_t stripe_id = i / ht->stripe_size;
 	
-		omp_set_lock(&ht->locks[stripe_id]);
+		// omp_set_lock(&ht->locks[stripe_id]);
 		if (!e->count) {
 			e->count = count;
 			e->sp_offset = sp_add(ht->sp, str, len);
 			e->hash = hash;
 			e->len = len;
 			
-			omp_unset_lock(&ht->locks[stripe_id]);
+			omp_unset_lock(&ht->lock);
+			// omp_unset_lock(&ht->locks[stripe_id]);
 			
 			#pragma omp atomic
 			ht->size += 1;
@@ -146,19 +151,21 @@ int ht_locked_insert(HashTable* ht, uint64_t hash, const char* str, size_t len, 
 			
 			#pragma omp atomic
 			ht->n_reference -= 1;
-
+			
 			return 0;
 		}
 		else if (e->hash != hash) { omp_unset_lock(&ht->locks[stripe_id]); continue; }
 		else if (strcmp(str, sp_get(ht->sp, e->sp_offset))) {
-			omp_unset_lock(&ht->locks[stripe_id]);
+			omp_unset_lock(&ht->lock);
+			// omp_unset_lock(&ht->locks[stripe_id]);
 			#pragma omp atomic
 				ht->true_coll += 1;
 			continue;
 		}
 		else {
 			e->count += count;
-			omp_unset_lock(&ht->locks[stripe_id]);
+			omp_unset_lock(&ht->lock);
+			// omp_unset_lock(&ht->locks[stripe_id]);
 			
 			#pragma omp atomic
 			ht->total += count; 
@@ -172,7 +179,7 @@ int ht_locked_insert(HashTable* ht, uint64_t hash, const char* str, size_t len, 
 	fprintf(stderr, "couldn't find place in table, table full\n");
 
 	#pragma omp atomic
-	ht->n_reference += 1;
+	ht->n_reference -= 1;
 
 	return 1;
 }

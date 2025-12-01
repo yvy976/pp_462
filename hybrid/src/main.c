@@ -199,13 +199,15 @@ static void flush_global(GlobalMapData* gmd) {
 }
 
 static void flush_to_global(HashTable* local_ht, GlobalMapData* gmd) {
-		// fprintf(stderr, "flushing local to global: %lu /  %lu\n", local_ht->size, local_ht->capacity);
+	//fprintf(stderr, "flushing local to global: %lu /  %lu\n", local_ht->size, local_ht->capacity);
+		// ht_print(local_ht);
 		// flush to main table
 		double map_flush_start, map_flush_end;
 		
 		map_flush_start = omp_get_wtime();
 		
 		HashTable* g_ht = gmd->g_ht;
+		size_t count;
 
 		for (size_t i = 0, count = 0; i < local_ht->capacity && count < local_ht->size; i++) {
 			HashEntry* entry = local_ht->entries + i;
@@ -219,6 +221,8 @@ static void flush_to_global(HashTable* local_ht, GlobalMapData* gmd) {
 
 			count += 1;
 		}
+
+		fprintf(stderr, "inserted %ld counts\n", count);
 
 		ht_clear(local_ht);
 
@@ -312,7 +316,7 @@ static void map_thread(GlobalMapData* gmd, LocalMapData* lmd) {
 		gmd->done += 1;
 
 		//fprintf(stderr, "thread %u printing hashtable:\n", omp_get_thread_num());
-		// ht_print(&local_ht);
+		ht_print(&local_ht);
 
 		// clear local table
 		// ht_clear(&local_ht);

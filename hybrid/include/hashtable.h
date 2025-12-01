@@ -17,6 +17,7 @@ struct HashEntry {
 struct HashTable {
 	HashEntry* entries;
 	StringPool* sp;
+	omp_lock_t lock;
 	omp_lock_t* locks;
 	size_t n_reference;
 	size_t n_locks;
