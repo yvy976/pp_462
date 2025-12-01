@@ -29,6 +29,7 @@ struct HashTable {
 	size_t true_coll;			// Number of TRUE COLLISIONS: Multiple strings with the same 64-bit hashes
 };
 
+void ht_deinit(HashTable* ht);
 void ht_free(HashTable* ht);
 int ht_init(HashTable* ht, size_t ht_capacity, size_t sp_capacity, size_t stripe_size);
 HashTable* ht_new(size_t ht_capacity, size_t sp_capacity, size_t stripe_size);

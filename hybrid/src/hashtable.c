@@ -26,7 +26,7 @@ struct HashTable {
 };
 */
 
-void ht_free(HashTable* ht) {
+void ht_deinit(HashTable* ht) {
 	free(ht->entries);
 	sp_free(ht->sp);
 
@@ -36,8 +36,11 @@ void ht_free(HashTable* ht) {
 		}
 		free(ht->locks);
 	}
+}
 
-	free(ht);
+void ht_free(HashTable* ht) {
+	ht_deinit(ht);
+	free(ht); 
 }
 
 int ht_init(HashTable* ht, size_t ht_capacity, size_t sp_capacity, size_t stripe_size) {
@@ -99,7 +102,7 @@ int ht_insert(HashTable* ht, uint64_t hash, const char* str, size_t len, size_t 
 			return 0;
 		}
 		else if (e->hash != hash) { continue; }
-		else if (strcmp(str, sp_get(ht->sp, e->sp_offset))) {
+		else if (strncmp(str, sp_get(ht->sp, e->sp_offset), (len > e->len) ? e->len : len)) {
 			ht->true_coll += 1;
 			continue;
 		}
@@ -147,7 +150,7 @@ int ht_locked_insert(HashTable* ht, uint64_t hash, const char* str, size_t len, 
 			return 0;
 		}
 		else if (e->hash != hash) { omp_unset_lock(&ht->locks[stripe_id]); continue; }
-		else if (strcmp(str, sp_get(ht->sp, e->sp_offset))) {
+		else if (strncmp(str, sp_get(ht->sp, e->sp_offset), (len > e->len) ? e->len : len)) {
 			omp_unset_lock(&ht->locks[stripe_id]);
 			#pragma omp atomic
 				ht->true_coll += 1;
