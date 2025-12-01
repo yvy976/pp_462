@@ -36,7 +36,7 @@
 
 #define OUTFORMAT_SIZE (1lu << 32)
 
-#define FLUSH_THRESHOLD 0.70
+#define FLUSH_THRESHOLD 0.7
 
 int rank, world_size;
 
@@ -182,7 +182,7 @@ static void try_flush_global(GlobalMapData* gmd) {
 static void flush_global(GlobalMapData* gmd) {
 	// fprintf(stderr, "atetmpting BLOCKING FLUSH global frame: %p at %lu / %lu\n", (void*) gmd->g_ht, gmd->g_ht->size, gmd->g_ht->capacity);
 	// fprintf(stderr, "table before flush\n");
-	ht_print(gmd->g_ht);
+	// ht_print(gmd->g_ht);
 
 	SendBuf* sb = gmd->sb;
 	omp_set_lock(&sb->table_lock);
@@ -375,7 +375,9 @@ static void send_thread(GlobalMapData* gmd, HashTable* reducer_table) {
 		}
 		
 		// attempting to send
-		// fprintf(stderr, "attempting to flush: %lu entries out of table %p\n", table->size, (void*)table);
+		fprintf(stderr, "attempting to flush: %lu entries out of table %p\n", table->size, (void*)table);
+		ht_print(table);
+
 		for (size_t i = 0, count = 0; i < table->capacity && count < table->size; i++) {
 			HashEntry* entry = table->entries + i;
 			if (!entry->count) continue;
@@ -485,6 +487,10 @@ static void rank0_coordinator_loop(int n_files, char** file_names, GlobalMapData
 			lmd[j].start = file_offsets[j];
 		}
 		lmd[gmd->n_mapper - 1].end = filesize;
+
+		for (size_t j = 0; j < gmd->n_mapper; j++) {
+			fprintf(stderr, "offset %lu: %lu\n", j, file_offsets[j]);
+		}
 		
 		// set final global data
 		gmd->file_name = file_name;
