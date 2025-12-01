@@ -15,7 +15,7 @@
 																					// map size as a multiple of PER THREAD
 																					// map sizes (HT_CAPACITY / N_THREADS)
 
-#define HT_CAPACITY (1 << 20)							// Total Capacity for all threads combined
+#define HT_CAPACITY (1 << 25)							// Total Capacity for all threads combined
 																					// (ENTRIES NOT BYTES)
 
 #define READBUFSIZE (1 << 6)							// BYTES
