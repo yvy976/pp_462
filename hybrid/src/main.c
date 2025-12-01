@@ -50,6 +50,15 @@ typedef struct SendEntry SendEntry;
 typedef struct SendBuf SendBuf;
 typedef struct RecvBuf RecvBuf;
 typedef struct RecvData RecvData;
+typedef struct Stats Stats;
+
+struct Stats {
+	double total_time;
+	double RM_time;				// Total time spent reading/mapping
+	double L_to_G_time;		// Total time spent flushing local maps to global maps
+	double G_to_N_time;		// Total time spent flushing the global map to the network
+	double R_to_R_time;		// Total time spend pushing recived entries into the reducer table
+};
 
 struct GlobalMapData {
 	char* file_name;
@@ -106,6 +115,8 @@ struct RecvBuf {
 struct RecvData {
 	enum command_t command;
 };
+
+Stats	stats;
 
 static inline char to_lower(char c) {
 	return ('a' - 'A') | c;
@@ -207,7 +218,6 @@ static void flush_to_global(HashTable* local_ht, GlobalMapData* gmd) {
 		map_flush_start = omp_get_wtime();
 		
 		HashTable* g_ht = gmd->g_ht;
-		size_t count;
 
 		for (size_t i = 0, count = 0; i < local_ht->capacity && count < local_ht->size; i++) {
 			HashEntry* entry = local_ht->entries + i;
@@ -222,11 +232,12 @@ static void flush_to_global(HashTable* local_ht, GlobalMapData* gmd) {
 			count += 1;
 		}
 
-		fprintf(stderr, "inserted %ld counts\n", count);
+		// fprintf(stderr, "inserted %ld counts\n", count);
 
 		ht_clear(local_ht);
 
 		map_flush_end = omp_get_wtime();
+		stats.L_to_G_time += map_flush_end - map_flush_start;
 
 		// fprintf(stderr, "It took %lf to flush local to global\n", map_flush_end - map_flush_start);
 }
@@ -276,8 +287,8 @@ static void map_thread(GlobalMapData* gmd, LocalMapData* lmd) {
 		//
 		// PARSING/READING/MAPPING LOOP
 		//
-		double read_start, read_end;
-		read_start = omp_get_wtime();
+		// double read_start, read_end;
+		// read_start = omp_get_wtime();
 
 		for (size_t offset = start; offset < end && c != EOF; offset++, c = fgetc(f)) {
 			if (!is_alphanum(c)) {
@@ -303,7 +314,7 @@ static void map_thread(GlobalMapData* gmd, LocalMapData* lmd) {
 				buf[len++] = c;
 		}
 
-		read_end = omp_get_wtime();
+		// read_end = omp_get_wtime();
 		// fprintf(stderr, "Thread %u took %lf seconds to read %lu words to local table\n", omp_get_thread_num(), read_end - read_start, count);
 
 		fclose(f);
@@ -316,7 +327,7 @@ static void map_thread(GlobalMapData* gmd, LocalMapData* lmd) {
 		gmd->done += 1;
 
 		//fprintf(stderr, "thread %u printing hashtable:\n", omp_get_thread_num());
-		ht_print(&local_ht);
+		// ht_print(&local_ht);
 
 		// clear local table
 		// ht_clear(&local_ht);
@@ -379,8 +390,11 @@ static void send_thread(GlobalMapData* gmd, HashTable* reducer_table) {
 		}
 		
 		// attempting to send
-		fprintf(stderr, "attempting to flush: %lu entries out of table %p\n", table->size, (void*)table);
-		ht_print(table);
+		// fprintf(stderr, "attempting to flush: %lu entries out of table %p\n", table->size, (void*)table);
+		// ht_print(table);
+		
+		double gtn_start, gtn_end;
+		gtn_start = omp_get_wtime();
 
 		for (size_t i = 0, count = 0; i < table->capacity && count < table->size; i++) {
 			HashEntry* entry = table->entries + i;
@@ -417,6 +431,9 @@ static void send_thread(GlobalMapData* gmd, HashTable* reducer_table) {
 			count += 1;
 		}
 
+		gtn_end = omp_get_wtime();
+		stats.G_to_N_time += gtn_end - gtn_start;
+
 		ht_clear(table);
 		omp_unset_lock(&sb->table_lock);
 
@@ -445,11 +462,17 @@ static void recieve_thread(HashTable* reducer_table, RecvBuf* rb, RecvData* rd) 
 			// fprintf(stderr, "RECIEVING\n");
 			MPI_Mrecv(rb->buffer, size, MPI_BYTE, &m, MPI_STATUS_IGNORE);
 			// fprintf(stderr, "recieved %d bytes (%ld entries) from process %d\n", size, size / sizeof(SendEntry), s.MPI_SOURCE);
-	
+			
+			double insert_start, insert_end;
+			insert_start = omp_get_wtime();
+
 			for (size_t i = 0; i < size / sizeof(SendEntry); i++) {
 				SendEntry* entry = rb->buffer + i;
 				ht_locked_insert(reducer_table, entry->hash, entry->str, entry->len, entry->count);
-			} 
+			}
+
+			insert_end = omp_get_wtime();
+			stats.R_to_R_time = insert_end - insert_start;
 		} else if (rd->command == DIE) {
 			// fprintf(stderr, "recieve %u thread exiting\n", omp_get_thread_num());
 			break;
@@ -478,7 +501,7 @@ static void rank0_coordinator_loop(int n_files, char** file_names, GlobalMapData
 		if (filesize == (size_t) -1) { fprintf(stderr, "Failed to fseek\n"); return; }
 		if (fseek(f, 0, SEEK_SET) == -1) { fprintf(stderr, "Failed to seek back to beginning\n"); return; }
 		
-		fprintf(stderr, "rank 0 working on file index: %d\n", i);
+		// fprintf(stderr, "rank 0 working on file index: %d\n", i);
 
 		// Calculate offsets on word boundaries
 		calculate_start_offsets(f, filesize, file_offsets, gmd->n_mapper);
@@ -492,10 +515,6 @@ static void rank0_coordinator_loop(int n_files, char** file_names, GlobalMapData
 		}
 		lmd[gmd->n_mapper - 1].end = filesize;
 
-		for (size_t j = 0; j < gmd->n_mapper; j++) {
-			fprintf(stderr, "offset %lu: %lu\n", j, file_offsets[j]);
-		}
-		
 		// set final global data
 		gmd->file_name = file_name;
 
@@ -521,7 +540,7 @@ static void rank0_coordinator_loop(int n_files, char** file_names, GlobalMapData
 				if (i + 1 < n_files) {
 					data = ++i;
 					
-					fprintf(stderr, "sending back index: %u\n", i);
+					// fprintf(stderr, "sending back index: %u\n", i);
 				} else { other_active_procs -= 1; }
 				
 				MPI_Send(&data, 1, MPI_INT, s.MPI_SOURCE, 1, MPI_COMM_WORLD);
@@ -572,7 +591,7 @@ static void rankother_coordinator_loop(int n_files, char** file_names, GlobalMap
 		if (filesize == (size_t) -1) { fprintf(stderr, "Failed to fseek\n"); return; }
 		if (fseek(f, 0, SEEK_SET) == -1) { fprintf(stderr, "Failed to seek back to beginning\n"); return; }
 		
-		fprintf(stderr, "Rank %d is working on file index: %d\n", rank, file_index);
+		//fprintf(stderr, "Rank %d is working on file index: %d\n", rank, file_index);
 
 		// Calculate offsets on word boundaries
 		calculate_start_offsets(f, filesize, file_offsets, gmd->n_mapper);
@@ -632,11 +651,14 @@ rankother_coordinator_loop_request:
 static void coordinator_thread(int n_files, char** file_names, GlobalMapData* gmd, LocalMapData* lmd) {
 	SendBuf* sb = gmd->sb;
 	
+	double map_start, map_end;
+	map_start = omp_get_wtime();
+
 	if (!rank)
 		rank0_coordinator_loop(n_files, file_names, gmd, lmd);
 	else
 		rankother_coordinator_loop(n_files, file_names, gmd, lmd); 
-
+	
 	// signal mappers to flush and die
 	gmd->done = 0;
 	gmd->command = DIE;
@@ -644,6 +666,9 @@ static void coordinator_thread(int n_files, char** file_names, GlobalMapData* gm
 		pthread_cond_broadcast(&gmd->cond);
 		nanosleep(&(struct timespec) { 0, 100000 }, NULL);
 	}
+
+	map_end = omp_get_wtime();
+	stats.RM_time = map_end - map_start;
 
 	// flush the global table
 	if (gmd->g_ht->size > 0) {
@@ -721,7 +746,7 @@ int main(int argc, char** argv) {
 	sb.signal = 0;
 	sb.working = 0;
 	sb.table = g_ht2;
-	fprintf(stderr, "sb.table: %p\n", (void*) sb.table);
+	// fprintf(stderr, "sb.table: %p\n", (void*) sb.table);
 
 	if (!sb.table) { fprintf(stderr, "Failed to allocate g_ht swap table\n"); }
 	
@@ -820,15 +845,21 @@ int main(int argc, char** argv) {
 			// fprintf(stderr, "Rank %u, SendBuf Table Final: \n", rank);
 			// ht_print(sb.table);
 
-			fprintf(stderr, "Rank %u, Reducer Table Final: \n", rank);
-			ht_print(&reducer_table);
+			// fprintf(stderr, "Rank %u, Reducer Table Final: \n", rank);
+			// ht_print(&reducer_table);
 		}
 
 	}
 
 	stop = omp_get_wtime();
-	if (!rank)
-		fprintf(stderr, "Total Time: %lf\n", stop - start);
+	if (!rank) {
+		stats.total_time = stop - start;
+		fprintf(stderr, "Total Time: %lf\n", stats.total_time);
+		fprintf(stderr, "RM Time: %lf\n", stats.RM_time);
+		fprintf(stderr, "Local to Global time: %lf\n", stats.L_to_G_time);
+		fprintf(stderr, "Global to Netwokr time: %lf\n", stats.G_to_N_time);
+		fprintf(stderr, "Recieved Data to Reduce Table time: %lf\n", stats.R_to_R_time);
+	}
 
 	// free everything but the reducer table
 	free(lmd);
@@ -856,7 +887,7 @@ int main(int argc, char** argv) {
 	free(recv_buffers);
 	free(recv_data);
 	
-	fprintf(stderr, "printing to %s\n", argv[1]);
+	// fprintf(stderr, "printing to %s\n", argv[1]);
 	// make start formatting output into buffers
 
 	size_t n_threads = omp_get_max_threads();
@@ -882,7 +913,7 @@ int main(int argc, char** argv) {
 		size_t start = chunk_size * i;
 		size_t end = (i + 1 == n_threads) ? reducer_table.capacity : start + chunk_size;
 		
-		fprintf(stderr, "threaed: %d doing start %ld end %ld\n", omp_get_thread_num(), start, end);
+		// fprintf(stderr, "threaed: %d doing start %ld end %ld\n", omp_get_thread_num(), start, end);
 		size_t used = 0;
 		char* buf = malloc(sizeof(char) * buffer_capacity);
 
@@ -911,14 +942,14 @@ int main(int argc, char** argv) {
 				j--;
 			} else {
 				used += n;
-			}
+			}	
 		}
 
 		// flush buffers
 		if (used) {
 			omp_set_lock(write_lock);
 			if (fwrite(buf, 1, used, f) != used) {
-				fprintf(stderr, "ailed to write\n");
+				fprintf(stderr, "failed to write\n");
 			}
 			omp_unset_lock(write_lock);
 
@@ -930,7 +961,7 @@ int main(int argc, char** argv) {
 	fclose(f);
 
 	if (rank + 1 < world_size) {
-		fprintf(stderr, "rank %d done, signalling other thread: %d\n", rank, rank + 1);
+		// fprintf(stderr, "rank %d done, signalling other thread: %d\n", rank, rank + 1);
 		MPI_Send(NULL, 0, MPI_CHAR, rank + 1, 0, MPI_COMM_WORLD);
 	}
 
