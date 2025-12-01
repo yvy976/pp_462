@@ -36,7 +36,7 @@
 
 #define OUTFORMAT_SIZE (1lu << 32)
 
-#define FLUSH_THRESHOLD 0.50
+#define FLUSH_THRESHOLD 0.70
 
 int rank, world_size;
 
@@ -854,6 +854,9 @@ int main(int argc, char** argv) {
 	size_t chunk_size = reducer_table.capacity / n_threads;
 	
 	FILE* f;
+	omp_lock_t* write_lock = & (omp_lock_t) {};
+	omp_init_lock(write_lock);
+
 	if (!rank) {
 		f = fopen(argv[1], "w");
 		if (!f) { fprintf(stderr, "rank 0 failed to open the output file\n"); return 1; }
@@ -888,12 +891,14 @@ int main(int argc, char** argv) {
 			// truncated, we should flush the buffer
 
 			if (n >= remaining) {
+				omp_set_lock(write_lock);
 				if (fwrite(buf, 1, used, f) != used) {
 					fprintf(stderr, "failed to write\n");
 				}
+				omp_unset_lock(write_lock);
 
 				used = 0;
-				j--; 
+				j--;
 			} else {
 				used += n;
 			}
@@ -901,9 +906,11 @@ int main(int argc, char** argv) {
 
 		// flush buffers
 		if (used) {
+			omp_set_lock(write_lock);
 			if (fwrite(buf, 1, used, f) != used) {
 				fprintf(stderr, "ailed to write\n");
 			}
+			omp_unset_lock(write_lock);
 
 			used = 0;
 		}
